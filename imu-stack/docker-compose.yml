@@ -1,0 +1,50 @@
+version: "3.9"
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-imu}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      TIMESCALEDB_TELEMETRY: "off"
+    ports: ["5433:5432"]
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./migrations/imu_timescale_migrations.sql:/docker-entrypoint-initdb.d/001_imu.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-imu}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    build: ./worker
+    environment:
+      DB_DSN: ${DB_DSN:-postgresql://postgres:postgres@db:5432/imu}
+      WS_URL: ${WS_URL:-ws://host.docker.internal:8765/ws/json}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # если хочешь проксировать web + ws на одном :8080
+  nginx:
+    build:
+      context: .              # <— корень проекта!
+      dockerfile: infra/Dockerfile
+    ports: ["8080:8080"]
+    depends_on:
+      - worker
+    restart: unless-stopped
+  api:
+    build: ./api
+    environment:
+      DB_DSN: ${DB_DSN:-postgresql://postgres:postgres@db:5432/imu}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+
+volumes:
+  db_data:
