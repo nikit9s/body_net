@@ -1,300 +1,260 @@
+#!/usr/bin/env python3
+"""BLE → WebSocket bridge for T-Watch IMU devices.
+
+Discovers T-Watch-IMU devices, connects via BLE, reassembles fragmented
+binary frames, verifies CRC32, converts to JSON and broadcasts over WS.
+Handles up to MAX_DEVICES simultaneously with automatic reconnection.
+"""
+
 import asyncio
 import contextlib
 import json
 import os
-import re
 import signal
 import time
+import zlib
 from typing import Dict, Optional, Set, Tuple
 
 from bleak import BleakClient, BleakError, BleakScanner
-from websockets import serve  
+from websockets import serve
 
-# ========= настройки / UUID =========
+# ─── Configuration ──────────────────────────────────────────────────
 DEVICE_NAME_SUBSTR = "T-Watch-IMU"
-
 SVC_UUID = "6f2d5d52-0f4d-4b2a-a02b-5a7a5b3a0e11"
-TX_UUID  = "f5c8b9d0-3a5d-4d9d-9d67-2d7f1b9e4b22"  
-RX_UUID  = "e8b6a830-8f6b-4d9c-a71c-6d8c2a3a5f33"  
+TX_UUID  = "f5c8b9d0-3a5d-4d9d-9d67-2d7f1b9e4b22"
+RX_UUID  = "e8b6a830-8f6b-4d9c-a71c-6d8c2a3a5f33"
 
-WS_HOST = os.environ.get("WS_HOST", "0.0.0.0")
-WS_PORT = int(os.environ.get("WS_PORT", "8765"))
+WS_HOST     = os.environ.get("WS_HOST", "0.0.0.0")
+WS_PORT     = int(os.environ.get("WS_PORT", "8765"))
+MAX_DEVICES = int(os.environ.get("MAX_DEVICES", "4"))
+VERBOSE     = os.environ.get("VERBOSE", "1") == "1"
 
-# Протокол
-MAGIC_FRAG  = 0xB1F1
-MAGIC_FRAME = 0xB10F
+# Protocol
+MAGIC_FRAG     = 0xB1F1
+MAGIC_FRAME    = 0xB10F
 FRAME_HDR_SIZE = 32
-FRAG_HDR_SIZE  = 10  # 2 magic + 1 ver + 1 part_idx + 4 seq + 2 frag_len
+FRAG_HDR_SIZE  = 10
 
-# Реассамблер housekeeping
-REASM_TTL_SEC  = 10.0
-CLEAN_PERIOD_S = 2.0
+# Timing
+CONNECT_TIMEOUT    = 12.0
+NOTIFY_TIMEOUT     = 8.0     # считаем соединение мёртвым если нет данных
+PING_INTERVAL      = 4.0     # как часто слать PING при тишине
+RECONNECT_MIN      = 1.0
+RECONNECT_MAX      = 30.0
+SCAN_PERIOD        = 8.0     # как часто сканировать
+SCAN_DURATION      = 5.0     # длительность одного скана
+REASM_TTL          = 10.0
+REASM_CLEAN_PERIOD = 3.0
 
-VERBOSE = True
-def vlog(*a, **k):
+
+def log(tag: str, msg: str):
+    ts = time.strftime("%H:%M:%S")
+    print(f"{ts} [{tag}] {msg}")
+
+
+def vlog(tag: str, msg: str):
     if VERBOSE:
-        print(*a, **k)
+        log(tag, msg)
 
-# ========= CRC32 =========
-import zlib
-def crc32_le_ieee(data: bytes) -> int:
-    # тот же алгоритм, что в прошивке: init=0xFFFFFFFF, финальный инверт
+
+# ─── CRC32 ──────────────────────────────────────────────────────────
+def crc32_ieee(data: bytes) -> int:
     return zlib.crc32(data) & 0xFFFFFFFF
 
-# ========= WS-хаб =========
+
+# ─── WebSocket Hub ──────────────────────────────────────────────────
 class Hub:
+    """Manages WS client subscriptions and broadcasts."""
+
     def __init__(self):
-        self.json_clients: Set = set()
-        self.bin_clients: Set = set()
+        self._json: Set = set()
+        self._bin: Set = set()
         self._lock = asyncio.Lock()
 
-    async def add_json(self, ws):
+    async def add(self, ws, kind: str):
         async with self._lock:
-            self.json_clients.add(ws)
-            print(f"[WS] +json client. total={len(self.json_clients)}")
-
-
-    async def add_bin(self, ws):
-        async with self._lock:
-            self.bin_clients.add(ws)
+            (self._json if kind == "json" else self._bin).add(ws)
+            log("WS", f"+{kind} client (total json={len(self._json)} bin={len(self._bin)})")
 
     async def remove(self, ws):
         async with self._lock:
-            was_json = ws in self.json_clients
-            self.json_clients.discard(ws)
-            self.bin_clients.discard(ws)
-            if was_json:
-                print(f"[WS] -json client. total={len(self.json_clients)}")
+            self._json.discard(ws)
+            self._bin.discard(ws)
 
     async def broadcast_json(self, obj: dict):
         data = json.dumps(obj)
         async with self._lock:
-            targets = list(self.json_clients)
-        if not targets:
-            print("[WS] broadcast_json: no clients")
-            return
-        sent = 0
+            targets = list(self._json)
         for ws in targets:
             try:
-                await ws.send(data); sent += 1 
+                await ws.send(data)
             except Exception:
-                pass
-        print(f"[WS] broadcast_json: sent={sent}, size={len(data)}")
+                await self.remove(ws)
 
     async def broadcast_bin(self, data: bytes):
         async with self._lock:
-            dead = []
-            for ws in list(self.bin_clients):
-                try:
-                    await ws.send(data)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                self.bin_clients.discard(ws)
+            targets = list(self._bin)
+        for ws in targets:
+            try:
+                await ws.send(data)
+            except Exception:
+                await self.remove(ws)
+
 
 hub = Hub()
 
-# ========= WS-обработчики =========
-async def ws_handler_json(ws):
-    await hub.add_json(ws)
+
+# ─── WS routing ────────────────────────────────────────────────────
+async def _ws_keepalive(ws):
     try:
         async for _ in ws:
             pass
     finally:
         await hub.remove(ws)
 
-async def ws_handler_bin(ws):
-    await hub.add_bin(ws)
-    try:
-        async for _ in ws:
-            pass
-    finally:
-        await hub.remove(ws)
 
 async def ws_router(ws):
-    raw_path = getattr(ws, "path", "/")
-    try:
-        print(f"[WS] incoming path={raw_path!r} from={ws.remote_address} "
-              f"headers={{'Host':{ws.request_headers.get('Host')!r}, "
-              f"'Origin':{ws.request_headers.get('Origin')!r}}}")
-    except Exception:
-        print(f"[WS] incoming path={raw_path!r}")
-
-    path = raw_path.split('?', 1)[0].rstrip('/') or '/'
-
+    path = getattr(ws, "path", "/").split("?", 1)[0].rstrip("/") or "/"
     if path in ("/ws/json", "/"):
-        if path == "/":
-            print("[WS] WARNING: client connected to '/', treating as /ws/json")
-        print("[WS] connected /ws/json")
-        await ws_handler_json(ws)
+        await hub.add(ws, "json")
+        await _ws_keepalive(ws)
     elif path == "/ws/bin":
-        print("[WS] connected /ws/bin")
-        await ws_handler_bin(ws)
+        await hub.add(ws, "bin")
+        await _ws_keepalive(ws)
     else:
-        reason = "use /ws/json or /ws/bin"
-        print(f"[WS] closing unknown path={raw_path!r} → {reason}")
-        await ws.close(code=1008, reason=reason)
+        await ws.close(code=1008, reason="use /ws/json or /ws/bin")
 
-# ========= Реассамблер =========
-class ReasmState:
-    __slots__ = ("parts", "got", "buf", "seen", "last_touch", "dev_id")
-    def __init__(self, total_len: int, parts: int, hdr: bytes, first_body_tail: bytes):
-        self.parts = parts
-        self.buf = bytearray(total_len)
+
+# ─── Frame reassembler ─────────────────────────────────────────────
+class _ReasmEntry:
+    __slots__ = ("buf", "got", "parts", "seen", "touched")
+
+    def __init__(self, total: int, parts: int, hdr: bytes, tail: bytes):
+        self.buf = bytearray(total)
         self.buf[:FRAME_HDR_SIZE] = hdr
-        self.buf[FRAME_HDR_SIZE:FRAME_HDR_SIZE+len(first_body_tail)] = first_body_tail
-        self.got = FRAME_HDR_SIZE + len(first_body_tail)
+        self.buf[FRAME_HDR_SIZE:FRAME_HDR_SIZE + len(tail)] = tail
+        self.got = FRAME_HDR_SIZE + len(tail)
+        self.parts = parts
         self.seen: Set[int] = {0}
-        self.last_touch = time.monotonic()
-        self.dev_id = int.from_bytes(hdr[4:8], "little")  # Extract dev_id from header
-        vlog(f"ReasmState: created with total_len={total_len} parts={parts} hdr={len(hdr)} tail={len(first_body_tail)} got={self.got} dev_id={self.dev_id}")
+        self.touched = time.monotonic()
+
 
 class Assembler:
     def __init__(self):
-        self._states: Dict[Tuple[int, int], ReasmState] = {}  # (dev_id, seq) -> ReasmState
-        self._seq_to_dev_id: Dict[int, int] = {}  # seq -> dev_id mapping for active reassemblies
+        self._map: Dict[Tuple[int, int], _ReasmEntry] = {}
+        self._seq_dev: Dict[int, int] = {}
         self._lock = asyncio.Lock()
-        self._stats = {"total_frags": 0, "total_frames": 0, "last_frame_time": 0}
+        self.frames_ok = 0
+        self.frames_err = 0
 
     async def cleanup_loop(self):
         while True:
-            await asyncio.sleep(CLEAN_PERIOD_S)
+            await asyncio.sleep(REASM_CLEAN_PERIOD)
             now = time.monotonic()
             async with self._lock:
-                stale = [(dev_id, seq) for (dev_id, seq), st in self._states.items() if now - st.last_touch > REASM_TTL_SEC]
-                for dev_id, seq in stale:
-                    vlog(f"reasm: drop stale dev_id={dev_id} seq={seq}")
-                    self._states.pop((dev_id, seq), None)
-                    self._seq_to_dev_id.pop(seq, None)
+                stale = [k for k, e in self._map.items() if now - e.touched > REASM_TTL]
+                for k in stale:
+                    self._seq_dev.pop(k[1], None)
+                    del self._map[k]
+                if stale:
+                    vlog("ASM", f"cleaned {len(stale)} stale entries")
 
-            # Статистика
-            vlog(f"reasm: stats - frags={self._stats['total_frags']} frames={self._stats['total_frames']} last_frame={now - self._stats['last_frame_time']:.1f}s ago")
-
-    async def on_fragment(self, frag: bytes):
+    async def feed(self, frag: bytes) -> Optional[bytes]:
+        """Feed a BLE notification. Returns completed frame or None."""
         if len(frag) < FRAG_HDR_SIZE:
-            vlog("frag: too short", len(frag)); return
+            return None
 
-        magic    = int.from_bytes(frag[0:2], "little")
-        ver      = frag[2]
-        part_idx = frag[3]
-        seq      = int.from_bytes(frag[4:8], "little", signed=False)
-        frag_len = int.from_bytes(frag[8:10], "little")
-        body     = frag[10:]
-
-        vlog(f"frag: magic=0x{magic:04X} ver={ver} idx={part_idx} seq={seq} len={frag_len} body={len(body)}")
-        vlog(f"frag: raw_frag_size={len(frag)} FRAG_HDR_SIZE={FRAG_HDR_SIZE} expected_body={len(frag)-FRAG_HDR_SIZE}")
-        if len(frag) > FRAG_HDR_SIZE:
-            vlog(f"frag: first_body_bytes={frag[FRAG_HDR_SIZE:FRAG_HDR_SIZE+min(8, len(frag)-FRAG_HDR_SIZE)].hex()}")
-
+        magic = int.from_bytes(frag[0:2], "little")
         if magic != MAGIC_FRAG:
-            return
-        if frag_len != len(body):
-            vlog(f"frag: len mismatch seq={seq} idx={part_idx} frag_len={frag_len} body={len(body)}")
-            return
-        if frag_len == 0:
-            vlog(f"frag: zero length for seq={seq} idx={part_idx}")
-            return
-            
-        if part_idx > 0 and len(body) == 0:
-            vlog(f"frag: empty body for non-zero part_idx={part_idx} seq={seq}")
-            return
+            return None
 
-        # Обновляем статистику
-        self._stats["total_frags"] += 1
+        part_idx = frag[3]
+        seq      = int.from_bytes(frag[4:8], "little")
+        frag_len = int.from_bytes(frag[8:10], "little")
+        body     = frag[FRAG_HDR_SIZE:]
+
+        if frag_len != len(body) or frag_len == 0:
+            return None
 
         if part_idx == 0:
-            if len(body) < FRAME_HDR_SIZE:
-                vlog("frag0: body < FRAME_HDR_SIZE"); return
-            hdr = body[:FRAME_HDR_SIZE]
-            if int.from_bytes(hdr[0:2], "little") != MAGIC_FRAME:
-                vlog("frag0: bad frame magic"); return
-            parts       = hdr[27]
-            payload_len = int.from_bytes(hdr[28:32], "little")
-            total       = FRAME_HDR_SIZE + payload_len + 4
-            tail        = body[FRAME_HDR_SIZE:]
-            vlog(f"frag0: hdr_size={FRAME_HDR_SIZE} payload_len={payload_len} total={total} tail_len={len(tail)}")
-            async with self._lock:
-                state = ReasmState(total, parts, hdr, tail)
-                self._states[(state.dev_id, seq)] = state
-                self._seq_to_dev_id[seq] = state.dev_id
-            vlog(f"frag0: dev_id={state.dev_id} seq={seq} parts={parts} total={total} first_tail={len(tail)} buf_size={len(self._states[(state.dev_id, seq)].buf)}")
-            return
-        else:
-            if len(body) < frag_len:
-                vlog(f"frag: body < frag_len seq={seq} idx={part_idx} frag_len={frag_len} body={len(body)}")
-                return
+            return await self._handle_first(seq, body)
+        return await self._handle_continuation(seq, part_idx, body)
+
+    async def _handle_first(self, seq: int, body: bytes) -> Optional[bytes]:
+        if len(body) < FRAME_HDR_SIZE:
+            return None
+        hdr = body[:FRAME_HDR_SIZE]
+        if int.from_bytes(hdr[0:2], "little") != MAGIC_FRAME:
+            return None
+
+        parts       = hdr[27]
+        payload_len = int.from_bytes(hdr[28:32], "little")
+        total       = FRAME_HDR_SIZE + payload_len + 4
+        tail        = body[FRAME_HDR_SIZE:]
+        dev_id      = int.from_bytes(hdr[4:8], "little")
 
         async with self._lock:
-            dev_id = self._seq_to_dev_id.get(seq)
+            entry = _ReasmEntry(total, parts, hdr, tail)
+            self._map[(dev_id, seq)] = entry
+            self._seq_dev[seq] = dev_id
+
+        if entry.got == total:
+            return await self._complete(dev_id, seq)
+        return None
+
+    async def _handle_continuation(self, seq: int, idx: int, body: bytes) -> Optional[bytes]:
+        async with self._lock:
+            dev_id = self._seq_dev.get(seq)
             if dev_id is None:
-                vlog(f"frag: no dev_id mapping for seq={seq} (idx={part_idx})"); return
+                return None
+            entry = self._map.get((dev_id, seq))
+            if entry is None or idx in entry.seen:
+                return None
+            end = entry.got + len(body)
+            if end > len(entry.buf):
+                del self._map[(dev_id, seq)]
+                self._seq_dev.pop(seq, None)
+                return None
+            entry.buf[entry.got:end] = body
+            entry.got = end
+            entry.seen.add(idx)
+            entry.touched = time.monotonic()
+            if entry.got != len(entry.buf):
+                return None
+        return await self._complete(dev_id, seq)
 
-            key = (dev_id, seq)
-            st = self._states.get(key)
-            if not st:
-                vlog(f"frag: no state for dev_id={dev_id} seq={seq} (idx={part_idx})"); return
-            vlog(f"frag+: dev_id={dev_id} seq={seq} idx={part_idx} cur={st.got}/{len(st.buf)} add={len(body)} seen={sorted(st.seen)}")
+    async def _complete(self, dev_id: int, seq: int) -> bytes:
+        async with self._lock:
+            entry = self._map.pop((dev_id, seq), None)
+            self._seq_dev.pop(seq, None)
+        if entry is None:
+            return None
+        self.frames_ok += 1
+        return bytes(entry.buf)
 
-            if part_idx in st.seen:
-                vlog(f"frag: duplicate part_idx={part_idx} for dev_id={dev_id} seq={seq}")
-                return
-            end = st.got + len(body)
-            vlog(f"frag+: dev_id={dev_id} seq={seq} idx={part_idx} body_size={len(body)} cursor={st.got} end={end} buf_size={len(st.buf)}")
-            if end > len(st.buf):
-                vlog(f"frag overflow: dev_id={dev_id} seq={seq} got={end}/{len(st.buf)} (idx={part_idx})")
-                self._states.pop(key, None)
-                self._seq_to_dev_id.pop(seq, None)
-                return
-            st.buf[st.got:end] = body
-            st.got = end
-            st.seen.add(part_idx)
-            st.last_touch = time.monotonic()
-            vlog(f"frag+: dev_id={dev_id} seq={seq} idx={part_idx} progress={st.got}/{len(st.buf)} parts_needed={st.parts}")
-            if st.got != len(st.buf):
-                return
-            frame = bytes(st.buf)
-            self._states.pop(key, None)
-            self._seq_to_dev_id.pop(seq, None)
 
-        completed_dev_id = int.from_bytes(frame[4:8], "little")
-        vlog(f"frame done: dev_id={completed_dev_id} seq={seq} total={len(frame)}")
-
-        self._stats["total_frames"] += 1
-        self._stats["last_frame_time"] = time.monotonic()
-
-        try:
-            obj = frame_to_json(frame)
-            await hub.broadcast_json(obj)
-            vlog(f"frame: JSON sent successfully, seq={seq}")
-        except Exception as e:
-            vlog(f"frame: ERROR processing seq={seq}: {e}")
-            try:
-                await hub.broadcast_bin(frame)
-                vlog(f"frame: Raw data sent as fallback, seq={seq}")
-            except Exception as e2:
-                vlog(f"frame: CRITICAL ERROR sending raw data seq={seq}: {e2}")
-
+# ─── Frame → JSON ──────────────────────────────────────────────────
 def frame_to_json(buf: bytes) -> dict:
     if len(buf) < FRAME_HDR_SIZE + 4:
         raise ValueError("frame too small")
     hdr = buf[:FRAME_HDR_SIZE]
     if int.from_bytes(hdr[0:2], "little") != MAGIC_FRAME:
-        raise ValueError("bad MAGIC_FRAME")
-    payload_len = int.from_bytes(hdr[28:32], "little")
-    n           = int.from_bytes(hdr[22:24], "little")
-    axes        = hdr[24]
-    if axes != 0b111:
-        raise ValueError("unsupported axes")
-    if payload_len != 3 * n * 2:
-        raise ValueError("payload_len mismatch")
-    if len(buf) != FRAME_HDR_SIZE + payload_len + 4:
-        raise ValueError("total length mismatch")
+        raise ValueError("bad magic")
 
-    data   = buf[:FRAME_HDR_SIZE] + buf[FRAME_HDR_SIZE:-4]
-    stored = int.from_bytes(buf[-4:], "little")
-    calc   = crc32_le_ieee(data)
-    if stored != calc:
-        raise ValueError(f"CRC mismatch: stored=0x{stored:08X} calc=0x{calc:08X}")
+    payload_len = int.from_bytes(hdr[28:32], "little")
+    n    = int.from_bytes(hdr[22:24], "little")
+    axes = hdr[24]
+    if axes != 0b111:
+        raise ValueError("unsupported axes mask")
+    if payload_len != 3 * n * 2:
+        raise ValueError("payload_len vs n mismatch")
+    if len(buf) != FRAME_HDR_SIZE + payload_len + 4:
+        raise ValueError("total size mismatch")
+
+    stored_crc = int.from_bytes(buf[-4:], "little")
+    calc_crc   = crc32_ieee(buf[:-4])
+    if stored_crc != calc_crc:
+        raise ValueError(f"CRC mismatch: 0x{stored_crc:08X} vs 0x{calc_crc:08X}")
 
     dev_id = int.from_bytes(hdr[4:8], "little")
     seq    = int.from_bytes(hdr[8:12], "little")
@@ -303,375 +263,389 @@ def frame_to_json(buf: bytes) -> dict:
     batt   = hdr[25]
 
     mv = memoryview(buf)[FRAME_HDR_SIZE:-4]
-    ax = [0]*n; ay = [0]*n; az = [0]*n
+    ax, ay, az = [0] * n, [0] * n, [0] * n
     off = 0
     for i in range(n):
-        ax[i] = int.from_bytes(mv[off:off+2], "little", signed=True); off += 2
+        ax[i] = int.from_bytes(mv[off:off + 2], "little", signed=True); off += 2
     for i in range(n):
-        ay[i] = int.from_bytes(mv[off:off+2], "little", signed=True); off += 2
+        ay[i] = int.from_bytes(mv[off:off + 2], "little", signed=True); off += 2
     for i in range(n):
-        az[i] = int.from_bytes(mv[off:off+2], "little", signed=True); off += 2
+        az[i] = int.from_bytes(mv[off:off + 2], "little", signed=True); off += 2
 
     return {
         "type": "imu",
-        "meta": {"dev_id": dev_id, "seq": seq, "ts0_ns": ts0_ns,
-                "fs_hz": fs_hz, "n": n, "axes": axes, "batt": batt},
-        "ax": ax, "ay": ay, "az": az
+        "meta": {
+            "dev_id": dev_id, "seq": seq, "ts0_ns": ts0_ns,
+            "fs_hz": fs_hz, "n": n, "axes": axes, "batt": batt,
+        },
+        "ax": ax, "ay": ay, "az": az,
     }
 
-# ========= BLE discovery =========
-def _name_of(dev, ad):
-    return (getattr(ad, "local_name", None)
-            or getattr(dev, "name", None)
-            or "")
 
-async def discover_candidates(timeout_s: float = 6.0):
-    print("scan: ищу устройства…")
-    seen = {}
-    def cb(d, ad):
+# ─── BLE helpers ───────────────────────────────────────────────────
+def _dev_name(dev, ad) -> str:
+    return getattr(ad, "local_name", None) or getattr(dev, "name", None) or ""
+
+
+async def _write_cmd(cli: BleakClient, data: bytes) -> bool:
+    for response in (True, False):
         try:
-            uuids = {u.lower() for u in (ad.service_uuids or [])}
-        except Exception:
-            uuids = set()
-        name = _name_of(d, ad)
-        if (SVC_UUID in uuids) or (DEVICE_NAME_SUBSTR in name):
-            seen[d.address] = (d, ad)
-
-    scanner = BleakScanner(cb)
-    await scanner.start()
-    await asyncio.sleep(timeout_s)
-    await scanner.stop()
-
-    if not seen:
-        print("scan: подходящих устройств не найдено")
-    else:
-        for addr, (d, ad) in seen.items():
-            try:
-                uuids = {u.lower() for u in (ad.service_uuids or [])}
-                rssi = getattr(ad, "rssi", None)
-            except Exception:
-                uuids, rssi = set(), None
-            print(f"scan: кандидат {addr} name='{_name_of(d, ad)}' RSSI={rssi} uuids={uuids}")
-    return list(seen.values())
-
-async def try_write(cli, uuid: str, data: bytes) -> bool:
-    try:
-        await cli.write_gatt_char(uuid, data, response=True)
-        return True
-    except Exception:
-        try:
-            await cli.write_gatt_char(uuid, data, response=False)
+            await cli.write_gatt_char(RX_UUID, data, response=response)
             return True
-        except Exception as e2:
-            print("write failed:", e2)
-            return False
-
-# ========= Сбор текстовых нотификаций + ожидание ACK =========
-class TextFeed:
-    def __init__(self):
-        self._q: asyncio.Queue[str] = asyncio.Queue()
-
-    def on_notify(self, data: bytes):
-        if 1 <= len(data) <= 64 and all(32 <= b < 127 for b in data):
-            try:
-                s = data.decode("utf-8", "ignore")
-                self._q.put_nowait(s)
-            except Exception:
-                pass
-
-    async def wait_for(self, pattern: str, timeout: float) -> Optional[str]:
-        deadline = time.monotonic() + timeout
-        prog = re.compile(pattern)
-        while True:
-            tleft = deadline - time.monotonic()
-            if tleft <= 0:
-                return None
-            try:
-                s = await asyncio.wait_for(self._q.get(), timeout=tleft)
-            except asyncio.TimeoutError:
-                return None
-            finally:
-                with contextlib.suppress(Exception):
-                    self._q.task_done()
-            if prog.search(s):
-                return s
-
-# ========= BLE main connect/stream =========
-async def try_connect_and_stream(dev, ad, asm: Assembler, on_connected=None, on_disconnected=None):
-    name = _name_of(dev, ad)
-    print(f"connect → {dev.address} ({name})")
-
-    notify_q: asyncio.Queue[bytes] = asyncio.Queue()
-    text_feed = TextFeed()
-    last_notify_time = time.monotonic()
-    notify_count = 0
-
-    def on_notify(_char, data: bytes):
-        nonlocal last_notify_time, notify_count
-        last_notify_time = time.monotonic()
-        notify_count += 1
-        
-        text_feed.on_notify(data)
-        try:
-            notify_q.put_nowait(data)
         except Exception:
-            pass
-
-    async def notify_loop():
-        notify_cnt = 0
-        while True:
-            data = await notify_q.get()
-            try:
-                notify_cnt += 1
-
-                if len(data) <= 32 and all(32 <= b < 127 for b in data):
-                    s = data.decode("utf-8", "ignore")
-                    print("notify(text):", s)
-
-                if notify_cnt % 10 == 1:
-                    print(f"notify #{notify_cnt}, {len(data)} bytes")
-
-                if len(data) >= FRAG_HDR_SIZE:
-                    await asm.on_fragment(data)
-                else:
-                    pass
-            finally:
-                notify_q.task_done()
-
-
-    try:
-        async with BleakClient(dev, timeout=10.0) as cli:
-            svcs = await cli.get_services()
-            want_tx = TX_UUID.lower()
-            want_rx = RX_UUID.lower()
-            have_tx = any(ch.uuid.lower() == want_tx for s in svcs for ch in s.characteristics)
-            have_rx = any(ch.uuid.lower() == want_rx for s in svcs for ch in s.characteristics)
-            print(f"svc check: TX={have_tx} RX={have_rx}")
-            if not (have_tx and have_rx):
-                print("skip: у устройства нет нужных характеристик TX/RX")
-                return False
-
-            await cli.start_notify(TX_UUID, on_notify)
-            notify_task = asyncio.create_task(notify_loop())
-
-            # ---------- Рукопожатие ----------
-            # 1) TIME:<unix>
-            await asyncio.sleep(0.2)
-            await try_write(cli, RX_UUID, f"TIME:{int(time.time())}".encode())
-
-            # Ждём ACK:TIME или STATE:SYNC=1
-            ack_time = await text_feed.wait_for(r"(ACK:TIME|STATE:.*SYNC=1)", timeout=2.0)
-            if ack_time:
-                vlog("handshake: time synced:", ack_time)
-            else:
-                vlog("handshake: no ACK:TIME, продолжаем вслепую")
-
-            # 2) STATE? (диагностика)
-            await try_write(cli, RX_UUID, b"STATE?")
-            _state = await text_feed.wait_for(r"^STATE:", timeout=1.0)
-            if _state:
-                print(_state)
-
-            # 3) START (до трёх попыток)
-            started = False
-            for attempt in range(3):
-                await try_write(cli, RX_UUID, b"START")
-                got = await text_feed.wait_for(r"(ACK:START|STATE:.*ACTIVE=1)", timeout=1.5)
-                if got:
-                    vlog("handshake: started:", got)
-                    started = True
-                    break
-                else:
-                    vlog(f"handshake: START no ack, retry {attempt+1}/3")
-
-            if not started:
-                print("WARN: не удалось получить ACK:START — но слушаем поток дальше")
-
-            print(f"streaming → ws://{WS_HOST}:{WS_PORT}/ws/json (и /ws/bin)")
-
-            # Notify that we're connected
-            if on_connected:
-                await on_connected(dev.address)
-
-            # Основной цикл: ждём разрыва + heartbeat
-            while True:
-                connected_attr = getattr(cli, "is_connected", False)
-                connected = bool(connected_attr() if callable(connected_attr) else connected_attr)
-                if not connected:
-                    break
-                
-                # Heartbeat: проверяем, что нотификации приходят
-                now = time.monotonic()
-                if now - last_notify_time > 5.0:  # 5 секунд без нотификаций
-                    print(f"WARN: No notifications for {now - last_notify_time:.1f}s, notify_count={notify_count}")
-                    # Попробуем отправить PING для проверки соединения
-                    await try_write(cli, RX_UUID, b"PING")
-                    last_notify_time = now  # Сброс таймера
-                
-                await asyncio.sleep(0.5)
-
-            notify_task.cancel()
-            with contextlib.suppress(Exception):
-                await notify_task
-
-            # Notify that we're disconnected
-            if on_disconnected:
-                await on_disconnected(dev.address)
-
-            return True
-
-    except BleakError as e:
-        print("BLE error:", e)
-        # Notify that we're disconnected on error
-        if on_disconnected:
-            await on_disconnected(dev.address)
-    except Exception as e:
-        print("err:", e)
-        # Notify that we're disconnected on error
-        if on_disconnected:
-            await on_disconnected(dev.address)
+            continue
     return False
 
-# ========= Device Manager =========
-class DeviceManager:
-    def __init__(self, max_devices: int = 4):
-        self.max_devices = max_devices
-        self.active_connections: Dict[str, asyncio.Task] = {}  # address -> connection_task
-        self.connected_devices: Set[str] = set()  # addresses of connected devices
-        self._lock = asyncio.Lock()
 
-    async def add_device(self, dev, ad, asm: Assembler) -> bool:
-        """Try to connect to a device if we haven't reached the limit"""
-        address = dev.address
+# ─── Device Session ────────────────────────────────────────────────
+class DeviceSession:
+    """Manages a single T-Watch: connect → handshake → stream → reconnect."""
 
-        async with self._lock:
-            if address in self.connected_devices:
-                vlog(f"Device {address} already connected")
-                return False
+    def __init__(self, address: str, name: str, asm: Assembler):
+        self.address = address
+        self.name = name
+        self.asm = asm
+        self.connected = False
+        self._failures = 0
+        self._stop = asyncio.Event()
+        self._task: Optional[asyncio.Task] = None
+        self._disconnect_event = asyncio.Event()
+        self._last_data = 0.0
 
-            if len(self.connected_devices) >= self.max_devices:
-                vlog(f"Max devices ({self.max_devices}) reached, cannot add {address}")
-                return False
+    def start(self):
+        if self._task is None or self._task.done():
+            self._stop.clear()
+            self._task = asyncio.create_task(self._loop())
+            log("DEV", f"Session started for {self.address} ({self.name})")
 
-            # Start connection task
-            task = asyncio.create_task(self._device_connection_loop(dev, ad, asm))
-            self.active_connections[address] = task
-            return True
-
-    async def remove_device(self, address: str):
-        """Remove a device from active connections"""
-        async with self._lock:
-            if address in self.active_connections:
-                task = self.active_connections[address]
-                task.cancel()
-                with contextlib.suppress(Exception):
-                    await task
-                self.active_connections.pop(address, None)
-            self.connected_devices.discard(address)
-            vlog(f"Device {address} removed. Active devices: {len(self.connected_devices)}")
-
-    async def _device_connection_loop(self, dev, ad, asm: Assembler):
-        """Connection loop for a single device with reconnection logic"""
-        address = dev.address
-        name = _name_of(dev, ad)
-
-        async def on_connected(addr):
-            async with self._lock:
-                self.connected_devices.add(addr)
-            vlog(f"Device {addr} connected. Total connected: {len(self.connected_devices)}")
-
-        async def on_disconnected(addr):
-            async with self._lock:
-                self.connected_devices.discard(addr)
-            vlog(f"Device {addr} disconnected. Total connected: {len(self.connected_devices)}")
-
-        try:
-            while True:
-                vlog(f"Attempting to connect to {address} ({name})")
-
-                success = await try_connect_and_stream(dev, ad, asm, on_connected, on_disconnected)
-                if success:
-                    vlog(f"Connection to {address} completed, will retry")
-                    await asyncio.sleep(1.0)  # Small delay before reconnection attempt
-                else:
-                    vlog(f"Failed to connect to {address}, will retry")
-                    await asyncio.sleep(2.0)  # Wait before retry
-
-        except asyncio.CancelledError:
-            vlog(f"Connection loop for {address} cancelled")
-        except Exception as e:
-            vlog(f"Error in connection loop for {address}: {e}")
-        finally:
-            async with self._lock:
-                self.connected_devices.discard(address)
-
-    def get_connected_count(self) -> int:
-        """Get number of currently connected devices"""
-        return len(self.connected_devices)
-
-    async def shutdown(self):
-        """Shutdown all connections"""
-        async with self._lock:
-            tasks = list(self.active_connections.values())
-            self.active_connections.clear()
-            self.connected_devices.clear()
-
-        for task in tasks:
-            task.cancel()
+    async def stop(self):
+        self._stop.set()
+        self._disconnect_event.set()
+        if self._task:
+            self._task.cancel()
             with contextlib.suppress(Exception):
-                await task
+                await self._task
+            self._task = None
 
-# ========= BLE loop с reconnection =========
-async def ble_loop():
-    asm = Assembler()
-    asyncio.create_task(asm.cleanup_loop())
+    async def _loop(self):
+        """Reconnection loop with exponential backoff."""
+        while not self._stop.is_set():
+            self.connected = False
+            self._disconnect_event.clear()
 
-    device_manager = DeviceManager(max_devices=4)
+            try:
+                ok = await self._connect_and_stream()
+                if ok:
+                    self._failures = 0
+                else:
+                    self._failures += 1
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log("DEV", f"{self.address} unexpected: {e}")
+                self._failures += 1
 
-    retry_delay = 2.0
-    while True:
+            self.connected = False
+
+            if self._stop.is_set():
+                break
+
+            delay = min(RECONNECT_MIN * (2 ** min(self._failures, 5)), RECONNECT_MAX)
+            log("DEV", f"{self.address} reconnect in {delay:.0f}s (failures={self._failures})")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            # Re-discover the device (addresses can change, especially on macOS)
+            fresh = await self._rediscover()
+            if fresh:
+                self.address = fresh.address
+                self.name = _dev_name(fresh, None)
+            else:
+                log("DEV", f"{self.address} not found during re-scan, will retry")
+                self._failures += 1
+
+    async def _rediscover(self) -> Optional[object]:
+        """Quick scan to find the device again by address or name."""
+        found = None
+        def cb(dev, ad):
+            nonlocal found
+            name = _dev_name(dev, ad)
+            try:
+                uuids = {u.lower() for u in (ad.service_uuids or [])}
+            except Exception:
+                uuids = set()
+            matches_addr = dev.address == self.address
+            matches_svc = SVC_UUID in uuids or DEVICE_NAME_SUBSTR in name
+            if matches_addr or (matches_svc and DEVICE_NAME_SUBSTR in name and self.name and self.name in name):
+                found = dev
+
         try:
-            cands = await discover_candidates(6.0)
-            retry_delay = 2.0
+            scanner = BleakScanner(cb)
+            await scanner.start()
+            await asyncio.sleep(4.0)
+            await scanner.stop()
+        except Exception as e:
+            log("DEV", f"Re-scan error: {e}")
+        return found
 
-            if not cands:
-                await asyncio.sleep(1.0)
+    async def _connect_and_stream(self) -> bool:
+        log("BLE", f"Connecting → {self.address} ({self.name})")
+
+        self._disconnect_event.clear()
+        self._last_data = time.monotonic()
+
+        def on_disconnect(_cli):
+            log("BLE", f"{self.address} disconnected (callback)")
+            self.connected = False
+            self._disconnect_event.set()
+
+        try:
+            cli = BleakClient(
+                self.address,
+                timeout=CONNECT_TIMEOUT,
+                disconnected_callback=on_disconnect,
+            )
+            await cli.connect()
+        except (BleakError, asyncio.TimeoutError, OSError) as e:
+            log("BLE", f"{self.address} connect failed: {e}")
+            return False
+
+        try:
+            return await self._run_session(cli)
+        finally:
+            with contextlib.suppress(Exception):
+                await cli.disconnect()
+
+    async def _run_session(self, cli: BleakClient) -> bool:
+        # Verify characteristics
+        svcs = await cli.get_services()
+        want = {TX_UUID.lower(), RX_UUID.lower()}
+        have = {ch.uuid.lower() for s in svcs for ch in s.characteristics}
+        if not want.issubset(have):
+            log("BLE", f"{self.address} missing TX/RX characteristics")
+            return False
+
+        # Subscribe to notifications
+        notify_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=512)
+
+        def on_notify(_ch, data: bytes):
+            self._last_data = time.monotonic()
+            try:
+                notify_q.put_nowait(data)
+            except asyncio.QueueFull:
+                pass
+
+        await cli.start_notify(TX_UUID, on_notify)
+
+        # Handshake: TIME sync
+        await asyncio.sleep(0.15)
+        await _write_cmd(cli, f"TIME:{int(time.time())}".encode())
+        ack = await self._wait_text(notify_q, "ACK:TIME", 2.0)
+        if ack:
+            vlog("BLE", f"{self.address} time synced")
+        else:
+            vlog("BLE", f"{self.address} no ACK:TIME, continuing")
+
+        # Handshake: START
+        started = False
+        for attempt in range(3):
+            await _write_cmd(cli, b"START")
+            ack = await self._wait_text(notify_q, "ACK:START", 1.5)
+            if ack:
+                started = True
+                break
+            vlog("BLE", f"{self.address} START attempt {attempt + 1}/3 no ack")
+
+        if not started:
+            log("BLE", f"{self.address} no ACK:START — listening anyway")
+
+        self.connected = True
+        self._failures = 0
+        log("BLE", f"{self.address} streaming active")
+
+        # Process notifications until disconnect
+        processor = asyncio.create_task(self._process_notifications(notify_q))
+        pinger = asyncio.create_task(self._ping_loop(cli))
+
+        try:
+            await self._disconnect_event.wait()
+        finally:
+            processor.cancel()
+            pinger.cancel()
+            with contextlib.suppress(Exception):
+                await processor
+            with contextlib.suppress(Exception):
+                await pinger
+
+        log("BLE", f"{self.address} session ended (frames={self.asm.frames_ok})")
+        return True
+
+    async def _process_notifications(self, q: asyncio.Queue):
+        """Drains notification queue, feeds assembler, broadcasts frames."""
+        while True:
+            data = await q.get()
+            try:
+                if len(data) < FRAG_HDR_SIZE:
+                    if len(data) <= 64 and all(32 <= b < 127 for b in data):
+                        vlog("TXT", data.decode("utf-8", "ignore"))
+                    continue
+
+                frame = await self.asm.feed(data)
+                if frame is None:
+                    continue
+
+                try:
+                    obj = frame_to_json(frame)
+                    await hub.broadcast_json(obj)
+                except Exception as e:
+                    vlog("ASM", f"frame_to_json error: {e}")
+                    await hub.broadcast_bin(frame)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                vlog("DEV", f"notify processing error: {e}")
+
+    async def _ping_loop(self, cli: BleakClient):
+        """Sends periodic PINGs when data stops flowing. Triggers disconnect on timeout."""
+        while True:
+            await asyncio.sleep(PING_INTERVAL)
+            silence = time.monotonic() - self._last_data
+
+            if silence > NOTIFY_TIMEOUT:
+                log("BLE", f"{self.address} no data for {silence:.1f}s — forcing disconnect")
+                self._disconnect_event.set()
+                return
+
+            if silence > PING_INTERVAL:
+                vlog("BLE", f"{self.address} silence {silence:.1f}s — sending PING")
+                ok = await _write_cmd(cli, b"PING")
+                if not ok:
+                    log("BLE", f"{self.address} PING write failed — forcing disconnect")
+                    self._disconnect_event.set()
+                    return
+
+    @staticmethod
+    async def _wait_text(q: asyncio.Queue, pattern: str, timeout: float) -> Optional[str]:
+        """Drain queue looking for a text notification matching pattern."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                data = await asyncio.wait_for(q.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return None
+            if len(data) <= 64 and all(32 <= b < 127 for b in data):
+                text = data.decode("utf-8", "ignore")
+                if pattern in text:
+                    return text
+
+
+# ─── Bridge (scan + manage sessions) ───────────────────────────────
+class Bridge:
+    def __init__(self):
+        self.asm = Assembler()
+        self.sessions: Dict[str, DeviceSession] = {}
+
+    async def run(self):
+        asyncio.create_task(self.asm.cleanup_loop())
+
+        retry_delay = 2.0
+        while True:
+            # Clean up finished sessions
+            self._cleanup_sessions()
+
+            active = sum(1 for s in self.sessions.values() if s.connected)
+            total = len(self.sessions)
+            free_slots = MAX_DEVICES - total
+
+            if free_slots <= 0:
+                await asyncio.sleep(SCAN_PERIOD)
                 continue
 
-            cands.sort(key=lambda x: 0 if (DEVICE_NAME_SUBSTR in _name_of(*x)) else 1)
+            try:
+                candidates = await self._scan()
+                retry_delay = 2.0
+            except (OSError, FileNotFoundError) as e:
+                log("BLE", f"Bluetooth not available: {e}")
+                log("BLE", f"Retrying in {retry_delay:.0f}s (on macOS — run bridge on host)")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60.0)
+                continue
+            except Exception as e:
+                log("BLE", f"Scan error: {e}")
+                await asyncio.sleep(5.0)
+                continue
 
-            connected_count = device_manager.get_connected_count()
-            vlog(f"Found {len(cands)} candidates, {connected_count}/{device_manager.max_devices} devices connected")
+            if not candidates:
+                vlog("SCAN", "No devices found")
+                await asyncio.sleep(SCAN_PERIOD)
+                continue
 
-            for dev, ad in cands:
-                if device_manager.get_connected_count() >= device_manager.max_devices:
+            for dev, ad in candidates:
+                if len(self.sessions) >= MAX_DEVICES:
                     break
-                address = dev.address
-                if address not in device_manager.connected_devices:
-                    success = await device_manager.add_device(dev, ad, asm)
-                    if success:
-                        vlog(f"Started connection attempt for {address}")
-                    else:
-                        vlog(f"Could not start connection for {address}")
+                addr = dev.address
+                if addr in self.sessions:
+                    continue
+                name = _dev_name(dev, ad)
+                session = DeviceSession(addr, name, self.asm)
+                self.sessions[addr] = session
+                session.start()
+                log("SCAN", f"New device: {addr} ({name})")
 
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(SCAN_PERIOD)
 
-        except (OSError, FileNotFoundError) as e:
-            print(f"[BLE] Bluetooth adapter not available: {e}")
-            print(f"[BLE] Retrying in {retry_delay:.0f}s… (on macOS run bridge on host, not in Docker)")
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 30.0)
-        except Exception as e:
-            print(f"[BLE] Unexpected error: {e}, retrying in 5s")
-            await asyncio.sleep(5.0)
+    async def _scan(self) -> list:
+        log("SCAN", "Searching for T-Watch-IMU devices…")
+        seen = {}
 
-    await device_manager.shutdown()
+        def cb(dev, ad):
+            try:
+                uuids = {u.lower() for u in (ad.service_uuids or [])}
+            except Exception:
+                uuids = set()
+            name = _dev_name(dev, ad)
+            if SVC_UUID in uuids or DEVICE_NAME_SUBSTR in name:
+                seen[dev.address] = (dev, ad)
 
-# ========= main =========
+        scanner = BleakScanner(cb)
+        await scanner.start()
+        await asyncio.sleep(SCAN_DURATION)
+        await scanner.stop()
+
+        for addr, (d, ad) in seen.items():
+            rssi = getattr(ad, "rssi", None)
+            log("SCAN", f"Found {addr} ({_dev_name(d, ad)}) RSSI={rssi}")
+        return list(seen.values())
+
+    def _cleanup_sessions(self):
+        dead = [addr for addr, s in self.sessions.items()
+                if s._task is not None and s._task.done()]
+        for addr in dead:
+            del self.sessions[addr]
+            vlog("SCAN", f"Cleaned up session for {addr}")
+
+    async def shutdown(self):
+        for s in self.sessions.values():
+            await s.stop()
+        self.sessions.clear()
+
+
+# ─── Main ──────────────────────────────────────────────────────────
 async def main():
-    print(f"WS up: ws://{WS_HOST}:{WS_PORT}/ws/json  |  ws://{WS_HOST}:{WS_PORT}/ws/bin")
+    log("MAIN", f"WS server: ws://{WS_HOST}:{WS_PORT}/ws/json | /ws/bin")
+    bridge = Bridge()
     async with serve(ws_router, WS_HOST, WS_PORT, max_size=None):
-        await ble_loop()
+        try:
+            await bridge.run()
+        finally:
+            await bridge.shutdown()
+
 
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
