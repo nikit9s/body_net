@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import json
+import os
 import re
 import signal
 import time
@@ -16,8 +17,8 @@ SVC_UUID = "6f2d5d52-0f4d-4b2a-a02b-5a7a5b3a0e11"
 TX_UUID  = "f5c8b9d0-3a5d-4d9d-9d67-2d7f1b9e4b22"  
 RX_UUID  = "e8b6a830-8f6b-4d9c-a71c-6d8c2a3a5f33"  
 
-WS_HOST = "127.0.0.1"
-WS_PORT = 8765
+WS_HOST = os.environ.get("WS_HOST", "0.0.0.0")
+WS_PORT = int(os.environ.get("WS_PORT", "8765"))
 
 # Протокол
 MAGIC_FRAG  = 0xB1F1
@@ -627,24 +628,24 @@ async def ble_loop():
 
     device_manager = DeviceManager(max_devices=4)
 
-    try:
-        while True:
+    retry_delay = 2.0
+    while True:
+        try:
             cands = await discover_candidates(6.0)
+            retry_delay = 2.0
+
             if not cands:
                 await asyncio.sleep(1.0)
                 continue
 
-            # приоритет по имени
             cands.sort(key=lambda x: 0 if (DEVICE_NAME_SUBSTR in _name_of(*x)) else 1)
 
             connected_count = device_manager.get_connected_count()
             vlog(f"Found {len(cands)} candidates, {connected_count}/{device_manager.max_devices} devices connected")
 
-            # Try to connect to new devices
             for dev, ad in cands:
                 if device_manager.get_connected_count() >= device_manager.max_devices:
                     break
-
                 address = dev.address
                 if address not in device_manager.connected_devices:
                     success = await device_manager.add_device(dev, ad, asm)
@@ -653,13 +654,18 @@ async def ble_loop():
                     else:
                         vlog(f"Could not start connection for {address}")
 
-            # Small delay before next discovery
             await asyncio.sleep(2.0)
 
-    except Exception as e:
-        vlog(f"BLE loop error: {e}")
-    finally:
-        await device_manager.shutdown()
+        except (OSError, FileNotFoundError) as e:
+            print(f"[BLE] Bluetooth adapter not available: {e}")
+            print(f"[BLE] Retrying in {retry_delay:.0f}s… (on macOS run bridge on host, not in Docker)")
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 30.0)
+        except Exception as e:
+            print(f"[BLE] Unexpected error: {e}, retrying in 5s")
+            await asyncio.sleep(5.0)
+
+    await device_manager.shutdown()
 
 # ========= main =========
 async def main():
