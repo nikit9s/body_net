@@ -25,13 +25,8 @@ import websockets
 DB_DSN = os.getenv("DB_DSN", "postgresql://postgres:postgres@localhost:5432/imu")
 WS_URL = os.getenv("WS_URL", "ws://127.0.0.1:8765/ws/json")
 
-G_MMPS2 = 9810.0                 # 1 g in mm/s^2
-MMPS2_TO_MG = 1000.0 / G_MMPS2   # convert mm/s^2 -> milli-g
-
-# --- simple step detector settings ---
-# threshold on |a| high-pass magnitude in milli-g
 STEP_THR_MG = 200.0
-REFRACTORY_SEC = 0.25  # min distance between steps
+REFRACTORY_SEC = 0.25
 
 async def ensure_conn():
     return await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=6)
@@ -99,10 +94,8 @@ async def insert_raw_and_features(conn, payload: dict):
         crc32
     )
 
-    # 2) Features (RMS/PEAK/steps)
-    # |a| in same units as input (mm/s^2), then convert to mG
-    amag = safe_magnitude(ax, ay, az)      # mm/s^2
-    amag_mg = amag * MMPS2_TO_MG          # milli-g
+    # 2) Features — firmware already sends values in mG
+    amag_mg = safe_magnitude(ax, ay, az)
 
     # quick high-pass to remove gravity for step detection
     amag_hp = hp_filter_simple(amag_mg, alpha=0.98)

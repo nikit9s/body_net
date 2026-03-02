@@ -22,20 +22,13 @@ services:
     environment:
       DB_DSN: ${DB_DSN:-postgresql://postgres:postgres@db:5432/imu}
       WS_URL: ${WS_URL:-ws://host.docker.internal:8765/ws/json}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       db:
         condition: service_healthy
     restart: unless-stopped
 
-  # если хочешь проксировать web + ws на одном :8080
-  nginx:
-    build:
-      context: .              # <— корень проекта!
-      dockerfile: infra/Dockerfile
-    ports: ["8080:8080"]
-    depends_on:
-      - worker
-    restart: unless-stopped
   api:
     build: ./api
     environment:
@@ -45,6 +38,17 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  nginx:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    ports: ["8080:8080"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - api
+      - worker
+    restart: unless-stopped
 
 volumes:
   db_data:

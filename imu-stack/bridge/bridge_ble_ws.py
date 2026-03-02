@@ -121,7 +121,7 @@ async def ws_router(ws):
 
     path = raw_path.split('?', 1)[0].rstrip('/') or '/'
 
-    if path == "/ws/json" or path == "/":
+    if path in ("/ws/json", "/"):
         if path == "/":
             print("[WS] WARNING: client connected to '/', treating as /ws/json")
         print("[WS] connected /ws/json")
@@ -129,28 +129,6 @@ async def ws_router(ws):
     elif path == "/ws/bin":
         print("[WS] connected /ws/bin")
         await ws_handler_bin(ws)
-    else:
-        reason = "use /ws/json or /ws/bin"
-        print(f"[WS] closing unknown path={raw_path!r} → {reason}")
-        await ws.close(code=1008, reason=reason)
-    
-    raw_path = getattr(ws, "path", "/")
-    print(f"[WS] incoming path={raw_path!r}")
-
-    path = raw_path.split('?', 1)[0].rstrip('/') or '/'
-    if path == "/ws/json":
-        print("[WS] connected /ws/json")
-        await ws_handler_json(ws)
-    elif path == "/ws/bin":
-        print("[WS] connected /ws/bin")
-        await ws_handler_bin(ws)
-    elif path == "/":
-        print("[WS] connected /  (noop)")
-        try:
-            async for _ in ws:
-                pass
-        finally:
-            await hub.remove(ws)
     else:
         reason = "use /ws/json or /ws/bin"
         print(f"[WS] closing unknown path={raw_path!r} → {reason}")
@@ -277,12 +255,8 @@ class Assembler:
             self._states.pop(key, None)
             self._seq_to_dev_id.pop(seq, None)
 
-        # Get dev_id from the completed frame for logging
-        if len(frame) >= FRAME_HDR_SIZE + 4:
-            completed_dev_id = int.from_bytes(frame[FRAME_HDR_SIZE-28:FRAME_HDR_SIZE-24], "little")  # dev_id is at offset 4 in header
-            vlog(f"frame done: dev_id={completed_dev_id} seq={seq} total={len(frame)}")
-        else:
-            vlog(f"frame done: seq={seq} total={len(frame)}")
+        completed_dev_id = int.from_bytes(frame[4:8], "little")
+        vlog(f"frame done: dev_id={completed_dev_id} seq={seq} total={len(frame)}")
 
         self._stats["total_frames"] += 1
         self._stats["last_frame_time"] = time.monotonic()
