@@ -8,6 +8,6 @@ RUN apt-get update && \
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bridge_ble_ws.py ./
+COPY ble_bridge/ ./ble_bridge/
 
-CMD ["python", "-u", "bridge_ble_ws.py"]
+CMD ["python", "-u", "-m", "ble_bridge"]
