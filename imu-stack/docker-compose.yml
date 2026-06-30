@@ -10,6 +10,7 @@ services:
     volumes:
       - db_data:/var/lib/postgresql/data
       - ./migrations/imu_timescale_migrations.sql:/docker-entrypoint-initdb.d/001_imu.sql:ro
+      - ./migrations:/migrations:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-imu}"]
       interval: 5s

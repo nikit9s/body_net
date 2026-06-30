@@ -162,11 +162,12 @@ static void pool_release(FrameBuf* fb) {
 
 //==================== BLE CALLBACKS =====================
 class ServerCB : public NimBLEServerCallbacks {
-  static void _onConnect() {
+public:
+  void onConnect(NimBLEServer* s, NimBLEConnInfo& connInfo) override {
     g_connected = true;
     Serial.println("[BLE] onConnect()");
   }
-  static void _onDisconnect(NimBLEServer* s) {
+  void onDisconnect(NimBLEServer* s, NimBLEConnInfo& connInfo, int reason) override {
     g_connected   = false;
     g_active      = false;
     g_timeSync    = false;
@@ -179,41 +180,30 @@ class ServerCB : public NimBLEServerCallbacks {
       for (int i=0;i<FRAME_POOL_SZ;i++) g_pool[i].inUse = false;
       xSemaphoreGive(g_poolMux);
     }
-    Serial.println("[BLE] onDisconnect() → re-adv");
+    Serial.printf("[BLE] onDisconnect(reason=%d) → re-adv\n", reason);
     if (s) s->startAdvertising();
   }
-  static void _onMTU(uint16_t MTU) {
+  void onMTUChange(uint16_t MTU, NimBLEConnInfo& connInfo) override {
     g_mtu_payload = (MTU > 3) ? (MTU - 3) : 20;
     if (g_mtu_payload > 200) g_mtu_payload = 200;
     Serial.printf("[BLE] MTU=%u (payload=%u)\n", MTU, g_mtu_payload);
   }
-public:
-  void onConnect(NimBLEServer* s) { _onConnect(); }
-  void onConnect(NimBLEServer* s, ble_gap_conn_desc*) { _onConnect(); }
-  void onConnect(NimBLEServer* s, NimBLEConnInfo&) { _onConnect(); }
-  void onDisconnect(NimBLEServer* s) { _onDisconnect(s); }
-  void onDisconnect(NimBLEServer* s, ble_gap_conn_desc*) { _onDisconnect(s); }
-  void onDisconnect(NimBLEServer* s, NimBLEConnInfo&) { _onDisconnect(s); }
-  void onMTUChange(uint16_t MTU, ble_gap_conn_desc*) { _onMTU(MTU); }
-  void onMTUChange(uint16_t MTU, NimBLEConnInfo&) { _onMTU(MTU); }
 };
 
 class TxCB : public NimBLECharacteristicCallbacks {
-  static void _hello(NimBLECharacteristic* c){
+public:
+  void onSubscribe(NimBLECharacteristic* c, NimBLEConnInfo& connInfo, uint16_t subValue) override {
     Serial.println("[BLE] TX subscribed");
     const char* hello = "HELLO";
     c->setValue((uint8_t*)hello, 5);
     c->notify();
   }
-public:
-  void onSubscribe(NimBLECharacteristic* c, uint16_t) { _hello(c); }
-  void onSubscribe(NimBLECharacteristic* c, ble_gap_conn_desc*, uint16_t) { _hello(c); }
-  void onSubscribe(NimBLECharacteristic* c, NimBLEConnInfo&, uint16_t) { _hello(c); }
 };
 
 // ---------- RX: ACK/NACK, STATE?, TIME, START/STOP ----------
 class RxCB : public NimBLECharacteristicCallbacks {
-  void handleWrite(NimBLECharacteristic* c) {
+public:
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     std::string v = c->getValue();
     trimInPlace(v);
 
@@ -252,10 +242,6 @@ class RxCB : public NimBLECharacteristicCallbacks {
     snprintf(msg, sizeof(msg), "NACK:UNKNOWN_CMD:%s", v.c_str());
     sendTX(msg);
   }
-public:
-  void onWrite(NimBLECharacteristic* c) { handleWrite(c); }
-  void onWrite(NimBLECharacteristic* c, ble_gap_conn_desc*) { handleWrite(c); }
-  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo&) { handleWrite(c); }
 
 private:
   static void sendTX(const char* s) {
@@ -567,7 +553,7 @@ void setup() {
   // BLE
   NimBLEDevice::init(DEVICE_NAME);
   NimBLEDevice::setDeviceName(DEVICE_NAME);
-  NimBLEDevice::setPower(ESP_PWR_LVL_P6);
+  NimBLEDevice::setPower(6);
   NimBLEDevice::setSecurityAuth(false,false,false);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
   NimBLEDevice::setMTU(185);

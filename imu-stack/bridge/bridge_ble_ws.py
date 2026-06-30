@@ -9,8 +9,10 @@ Handles up to MAX_DEVICES simultaneously with automatic reconnection.
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import signal
+import sys
 import time
 import zlib
 from typing import Dict, Optional, Set, Tuple
@@ -18,7 +20,61 @@ from typing import Dict, Optional, Set, Tuple
 from bleak import BleakClient, BleakError, BleakScanner
 from websockets import serve
 
-# ─── Configuration ──────────────────────────────────────────────────
+# ─── Logging ─────────────────────────────────────────────────────────
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "DEBUG" if os.environ.get("VERBOSE", "1") == "1" else "INFO")
+
+class _Formatter(logging.Formatter):
+    LEVEL_TAG = {
+        logging.DEBUG:    "DBG",
+        logging.INFO:     "INF",
+        logging.WARNING:  "WRN",
+        logging.ERROR:    "ERR",
+        logging.CRITICAL: "CRT",
+    }
+    LEVEL_COLOR = {
+        logging.DEBUG:    "\033[37m",     # white/gray
+        logging.INFO:     "\033[36m",     # cyan
+        logging.WARNING:  "\033[33m",     # yellow
+        logging.ERROR:    "\033[31m",     # red
+        logging.CRITICAL: "\033[1;31m",   # bold red
+    }
+    RESET = "\033[0m"
+
+    def __init__(self, use_color: bool = True):
+        super().__init__()
+        self._color = use_color
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts = time.strftime("%H:%M:%S", time.localtime(record.created))
+        ms = int(record.created * 1000) % 1000
+        tag = self.LEVEL_TAG.get(record.levelno, "???")
+        name = record.name.split(".")[-1]
+        msg = record.getMessage()
+
+        if self._color:
+            c = self.LEVEL_COLOR.get(record.levelno, "")
+            return f"{ts}.{ms:03d} {c}{tag}{self.RESET} [{name:>4s}] {msg}"
+        return f"{ts}.{ms:03d} {tag} [{name:>4s}] {msg}"
+
+
+def _setup_logging():
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_Formatter(use_color=sys.stdout.isatty()))
+    root = logging.getLogger("bridge")
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.DEBUG))
+    return root
+
+
+_root_log = _setup_logging()
+
+def _log(name: str) -> logging.Logger:
+    return _root_log.getChild(name)
+
+# ─── Configuration ───────────────────────────────────────────────────
+
 DEVICE_NAME_SUBSTR = "T-Watch-IMU"
 SVC_UUID = "6f2d5d52-0f4d-4b2a-a02b-5a7a5b3a0e11"
 TX_UUID  = "f5c8b9d0-3a5d-4d9d-9d67-2d7f1b9e4b22"
@@ -27,42 +83,33 @@ RX_UUID  = "e8b6a830-8f6b-4d9c-a71c-6d8c2a3a5f33"
 WS_HOST     = os.environ.get("WS_HOST", "0.0.0.0")
 WS_PORT     = int(os.environ.get("WS_PORT", "8765"))
 MAX_DEVICES = int(os.environ.get("MAX_DEVICES", "4"))
-VERBOSE     = os.environ.get("VERBOSE", "1") == "1"
 
-# Protocol
+# Protocol constants
 MAGIC_FRAG     = 0xB1F1
 MAGIC_FRAME    = 0xB10F
 FRAME_HDR_SIZE = 32
-FRAG_HDR_SIZE  = 10
+FRAG_HDR_SIZE  = 10   # 2 magic + 1 ver + 1 part_idx + 4 seq + 2 frag_len
 
-# Timing
+# Timing (seconds)
 CONNECT_TIMEOUT    = 12.0
-NOTIFY_TIMEOUT     = 8.0     # считаем соединение мёртвым если нет данных
-PING_INTERVAL      = 4.0     # как часто слать PING при тишине
+NOTIFY_TIMEOUT     = 8.0
+PING_INTERVAL      = 4.0
 RECONNECT_MIN      = 1.0
 RECONNECT_MAX      = 30.0
-SCAN_PERIOD        = 8.0     # как часто сканировать
-SCAN_DURATION      = 5.0     # длительность одного скана
+SCAN_PERIOD        = 8.0
+SCAN_DURATION      = 5.0
 REASM_TTL          = 10.0
 REASM_CLEAN_PERIOD = 3.0
 
+# ─── CRC32 ───────────────────────────────────────────────────────────
 
-def log(tag: str, msg: str):
-    ts = time.strftime("%H:%M:%S")
-    print(f"{ts} [{tag}] {msg}")
-
-
-def vlog(tag: str, msg: str):
-    if VERBOSE:
-        log(tag, msg)
-
-
-# ─── CRC32 ──────────────────────────────────────────────────────────
 def crc32_ieee(data: bytes) -> int:
     return zlib.crc32(data) & 0xFFFFFFFF
 
+# ─── WebSocket Hub ───────────────────────────────────────────────────
 
-# ─── WebSocket Hub ──────────────────────────────────────────────────
+_ws_log = _log("ws")
+
 class Hub:
     """Manages WS client subscriptions and broadcasts."""
 
@@ -70,41 +117,61 @@ class Hub:
         self._json: Set = set()
         self._bin: Set = set()
         self._lock = asyncio.Lock()
+        self._broadcast_count = 0
 
     async def add(self, ws, kind: str):
         async with self._lock:
             (self._json if kind == "json" else self._bin).add(ws)
-            log("WS", f"+{kind} client (total json={len(self._json)} bin={len(self._bin)})")
+            _ws_log.info("client connected  type=%s  json=%d  bin=%d",
+                         kind, len(self._json), len(self._bin))
 
     async def remove(self, ws):
         async with self._lock:
+            was_json = ws in self._json
+            was_bin = ws in self._bin
             self._json.discard(ws)
             self._bin.discard(ws)
+            if was_json or was_bin:
+                _ws_log.info("client disconnected  json=%d  bin=%d",
+                             len(self._json), len(self._bin))
 
     async def broadcast_json(self, obj: dict):
         data = json.dumps(obj)
         async with self._lock:
             targets = list(self._json)
+        if not targets:
+            return
+        dead = []
         for ws in targets:
             try:
                 await ws.send(data)
             except Exception:
-                await self.remove(ws)
+                dead.append(ws)
+        for ws in dead:
+            await self.remove(ws)
+        self._broadcast_count += 1
 
     async def broadcast_bin(self, data: bytes):
         async with self._lock:
             targets = list(self._bin)
+        dead = []
         for ws in targets:
             try:
                 await ws.send(data)
             except Exception:
-                await self.remove(ws)
+                dead.append(ws)
+        for ws in dead:
+            await self.remove(ws)
+
+    @property
+    def json_client_count(self) -> int:
+        return len(self._json)
 
 
 hub = Hub()
 
+# ─── WS routing ─────────────────────────────────────────────────────
 
-# ─── WS routing ────────────────────────────────────────────────────
 async def _ws_keepalive(ws):
     try:
         async for _ in ws:
@@ -122,10 +189,13 @@ async def ws_router(ws):
         await hub.add(ws, "bin")
         await _ws_keepalive(ws)
     else:
+        _ws_log.warning("rejected connection to unknown path=%s", path)
         await ws.close(code=1008, reason="use /ws/json or /ws/bin")
 
+# ─── Frame reassembler ──────────────────────────────────────────────
 
-# ─── Frame reassembler ─────────────────────────────────────────────
+_asm_log = _log("asm")
+
 class _ReasmEntry:
     __slots__ = ("buf", "got", "parts", "seen", "touched")
 
@@ -145,7 +215,9 @@ class Assembler:
         self._seq_dev: Dict[int, int] = {}
         self._lock = asyncio.Lock()
         self.frames_ok = 0
-        self.frames_err = 0
+        self.frames_crc_err = 0
+        self.frags_received = 0
+        self.frags_dropped = 0
 
     async def cleanup_loop(self):
         while True:
@@ -157,7 +229,8 @@ class Assembler:
                     self._seq_dev.pop(k[1], None)
                     del self._map[k]
                 if stale:
-                    vlog("ASM", f"cleaned {len(stale)} stale entries")
+                    self.frags_dropped += len(stale)
+                    _asm_log.debug("gc: expired=%d  pending=%d", len(stale), len(self._map))
 
     async def feed(self, frag: bytes) -> Optional[bytes]:
         """Feed a BLE notification. Returns completed frame or None."""
@@ -168,12 +241,15 @@ class Assembler:
         if magic != MAGIC_FRAG:
             return None
 
+        self.frags_received += 1
         part_idx = frag[3]
         seq      = int.from_bytes(frag[4:8], "little")
         frag_len = int.from_bytes(frag[8:10], "little")
         body     = frag[FRAG_HDR_SIZE:]
 
         if frag_len != len(body) or frag_len == 0:
+            self.frags_dropped += 1
+            _asm_log.debug("frag dropped: seq=%d idx=%d (len mismatch or empty)", seq, part_idx)
             return None
 
         if part_idx == 0:
@@ -198,6 +274,8 @@ class Assembler:
             self._map[(dev_id, seq)] = entry
             self._seq_dev[seq] = dev_id
 
+        # _asm_log.debug("frag[0]: dev=%d seq=%d parts=%d total=%d B", dev_id, seq, parts, total)
+
         if entry.got == total:
             return await self._complete(dev_id, seq)
         return None
@@ -214,6 +292,9 @@ class Assembler:
             if end > len(entry.buf):
                 del self._map[(dev_id, seq)]
                 self._seq_dev.pop(seq, None)
+                self.frags_dropped += 1
+                _asm_log.warning("frag overflow: dev=%d seq=%d idx=%d (%d > %d)",
+                                 dev_id, seq, idx, end, len(entry.buf))
                 return None
             entry.buf[entry.got:end] = body
             entry.got = end
@@ -230,10 +311,17 @@ class Assembler:
         if entry is None:
             return None
         self.frames_ok += 1
+        # _asm_log.debug("frame complete: dev=%d seq=%d (%d B)  total_ok=%d",
+        #                dev_id, seq, len(entry.buf), self.frames_ok)
         return bytes(entry.buf)
 
+    def stats_line(self) -> str:
+        return (f"frags_in={self.frags_received}  frames_ok={self.frames_ok}  "
+                f"crc_err={self.frames_crc_err}  dropped={self.frags_dropped}  "
+                f"pending={len(self._map)}")
 
-# ─── Frame → JSON ──────────────────────────────────────────────────
+# ─── Frame → JSON ───────────────────────────────────────────────────
+
 def frame_to_json(buf: bytes) -> dict:
     if len(buf) < FRAME_HDR_SIZE + 4:
         raise ValueError("frame too small")
@@ -281,8 +369,8 @@ def frame_to_json(buf: bytes) -> dict:
         "ax": ax, "ay": ay, "az": az,
     }
 
+# ─── BLE helpers ─────────────────────────────────────────────────────
 
-# ─── BLE helpers ───────────────────────────────────────────────────
 def _dev_name(dev, ad) -> str:
     return getattr(ad, "local_name", None) or getattr(dev, "name", None) or ""
 
@@ -296,8 +384,8 @@ async def _write_cmd(cli: BleakClient, data: bytes) -> bool:
             continue
     return False
 
+# ─── Device Session ──────────────────────────────────────────────────
 
-# ─── Device Session ────────────────────────────────────────────────
 class DeviceSession:
     """Manages a single T-Watch: connect → handshake → stream → reconnect."""
 
@@ -306,17 +394,23 @@ class DeviceSession:
         self.name = name
         self.asm = asm
         self.connected = False
+        self._log = _log("dev")
         self._failures = 0
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
         self._disconnect_event = asyncio.Event()
         self._last_data = 0.0
+        self._session_frames = 0
+
+    @property
+    def _addr(self) -> str:
+        return self.address[-8:]
 
     def start(self):
         if self._task is None or self._task.done():
             self._stop.clear()
             self._task = asyncio.create_task(self._loop())
-            log("DEV", f"Session started for {self.address} ({self.name})")
+            self._log.info("%s  session started  name=%s", self._addr, self.name)
 
     async def stop(self):
         self._stop.set()
@@ -328,10 +422,10 @@ class DeviceSession:
             self._task = None
 
     async def _loop(self):
-        """Reconnection loop with exponential backoff."""
         while not self._stop.is_set():
             self.connected = False
             self._disconnect_event.clear()
+            self._session_frames = 0
 
             try:
                 ok = await self._connect_and_stream()
@@ -342,33 +436,31 @@ class DeviceSession:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                log("DEV", f"{self.address} unexpected: {e}")
+                self._log.error("%s  unexpected error: %s", self._addr, e)
                 self._failures += 1
 
             self.connected = False
-
             if self._stop.is_set():
                 break
 
             delay = min(RECONNECT_MIN * (2 ** min(self._failures, 5)), RECONNECT_MAX)
-            log("DEV", f"{self.address} reconnect in {delay:.0f}s (failures={self._failures})")
+            self._log.info("%s  reconnecting in %.0fs  failures=%d", self._addr, delay, self._failures)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
                 break
             except asyncio.TimeoutError:
                 pass
 
-            # Re-discover the device (addresses can change, especially on macOS)
             fresh = await self._rediscover()
             if fresh:
                 self.address = fresh.address
                 self.name = _dev_name(fresh, None)
+                self._log.debug("%s  re-discovered", self._addr)
             else:
-                log("DEV", f"{self.address} not found during re-scan, will retry")
+                self._log.warning("%s  not found during re-scan", self._addr)
                 self._failures += 1
 
     async def _rediscover(self) -> Optional[object]:
-        """Quick scan to find the device again by address or name."""
         found = None
         def cb(dev, ad):
             nonlocal found
@@ -377,9 +469,9 @@ class DeviceSession:
                 uuids = {u.lower() for u in (ad.service_uuids or [])}
             except Exception:
                 uuids = set()
-            matches_addr = dev.address == self.address
-            matches_svc = SVC_UUID in uuids or DEVICE_NAME_SUBSTR in name
-            if matches_addr or (matches_svc and DEVICE_NAME_SUBSTR in name and self.name and self.name in name):
+            if dev.address == self.address:
+                found = dev
+            elif (SVC_UUID in uuids or DEVICE_NAME_SUBSTR in name) and self.name and self.name in name:
                 found = dev
 
         try:
@@ -388,17 +480,17 @@ class DeviceSession:
             await asyncio.sleep(4.0)
             await scanner.stop()
         except Exception as e:
-            log("DEV", f"Re-scan error: {e}")
+            self._log.warning("%s  re-scan failed: %s", self._addr, e)
         return found
 
     async def _connect_and_stream(self) -> bool:
-        log("BLE", f"Connecting → {self.address} ({self.name})")
-
+        self._log.info("%s  connecting  name=%s", self._addr, self.name)
         self._disconnect_event.clear()
         self._last_data = time.monotonic()
 
         def on_disconnect(_cli):
-            log("BLE", f"{self.address} disconnected (callback)")
+            self._log.info("%s  BLE disconnected (callback)  session_frames=%d",
+                           self._addr, self._session_frames)
             self.connected = False
             self._disconnect_event.set()
 
@@ -410,7 +502,7 @@ class DeviceSession:
             )
             await cli.connect()
         except (BleakError, asyncio.TimeoutError, OSError) as e:
-            log("BLE", f"{self.address} connect failed: {e}")
+            self._log.warning("%s  connect failed: %s", self._addr, e)
             return False
 
         try:
@@ -420,15 +512,13 @@ class DeviceSession:
                 await cli.disconnect()
 
     async def _run_session(self, cli: BleakClient) -> bool:
-        # Verify characteristics
         svcs = await cli.get_services()
         want = {TX_UUID.lower(), RX_UUID.lower()}
         have = {ch.uuid.lower() for s in svcs for ch in s.characteristics}
         if not want.issubset(have):
-            log("BLE", f"{self.address} missing TX/RX characteristics")
+            self._log.warning("%s  missing TX/RX characteristics", self._addr)
             return False
 
-        # Subscribe to notifications
         notify_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=512)
 
         def on_notify(_ch, data: bytes):
@@ -444,10 +534,7 @@ class DeviceSession:
         await asyncio.sleep(0.15)
         await _write_cmd(cli, f"TIME:{int(time.time())}".encode())
         ack = await self._wait_text(notify_q, "ACK:TIME", 2.0)
-        if ack:
-            vlog("BLE", f"{self.address} time synced")
-        else:
-            vlog("BLE", f"{self.address} no ACK:TIME, continuing")
+        self._log.debug("%s  TIME sync: %s", self._addr, "ok" if ack else "no ack")
 
         # Handshake: START
         started = False
@@ -457,40 +544,38 @@ class DeviceSession:
             if ack:
                 started = True
                 break
-            vlog("BLE", f"{self.address} START attempt {attempt + 1}/3 no ack")
+            self._log.debug("%s  START attempt %d/3: no ack", self._addr, attempt + 1)
 
         if not started:
-            log("BLE", f"{self.address} no ACK:START — listening anyway")
+            self._log.warning("%s  no ACK:START — listening anyway", self._addr)
 
         self.connected = True
         self._failures = 0
-        log("BLE", f"{self.address} streaming active")
+        self._log.info("%s  streaming  ws_clients=%d", self._addr, hub.json_client_count)
 
-        # Process notifications until disconnect
         processor = asyncio.create_task(self._process_notifications(notify_q))
         pinger = asyncio.create_task(self._ping_loop(cli))
+        stats_task = asyncio.create_task(self._stats_loop())
 
         try:
             await self._disconnect_event.wait()
         finally:
-            processor.cancel()
-            pinger.cancel()
-            with contextlib.suppress(Exception):
-                await processor
-            with contextlib.suppress(Exception):
-                await pinger
+            for t in (processor, pinger, stats_task):
+                t.cancel()
+                with contextlib.suppress(Exception):
+                    await t
 
-        log("BLE", f"{self.address} session ended (frames={self.asm.frames_ok})")
+        self._log.info("%s  session ended  session_frames=%d  %s",
+                       self._addr, self._session_frames, self.asm.stats_line())
         return True
 
     async def _process_notifications(self, q: asyncio.Queue):
-        """Drains notification queue, feeds assembler, broadcasts frames."""
         while True:
             data = await q.get()
             try:
                 if len(data) < FRAG_HDR_SIZE:
                     if len(data) <= 64 and all(32 <= b < 127 for b in data):
-                        vlog("TXT", data.decode("utf-8", "ignore"))
+                        self._log.debug("%s  txt: %s", self._addr, data.decode("utf-8", "ignore"))
                     continue
 
                 frame = await self.asm.feed(data)
@@ -500,36 +585,44 @@ class DeviceSession:
                 try:
                     obj = frame_to_json(frame)
                     await hub.broadcast_json(obj)
-                except Exception as e:
-                    vlog("ASM", f"frame_to_json error: {e}")
+                    self._session_frames += 1
+                except ValueError as e:
+                    self.asm.frames_crc_err += 1
+                    self._log.warning("%s  frame decode error: %s", self._addr, e)
                     await hub.broadcast_bin(frame)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                vlog("DEV", f"notify processing error: {e}")
+                self._log.error("%s  notify handler error: %s", self._addr, e)
 
     async def _ping_loop(self, cli: BleakClient):
-        """Sends periodic PINGs when data stops flowing. Triggers disconnect on timeout."""
         while True:
             await asyncio.sleep(PING_INTERVAL)
             silence = time.monotonic() - self._last_data
 
             if silence > NOTIFY_TIMEOUT:
-                log("BLE", f"{self.address} no data for {silence:.1f}s — forcing disconnect")
+                self._log.warning("%s  no data for %.1fs — forcing disconnect", self._addr, silence)
                 self._disconnect_event.set()
                 return
 
             if silence > PING_INTERVAL:
-                vlog("BLE", f"{self.address} silence {silence:.1f}s — sending PING")
+                self._log.debug("%s  silence %.1fs — PING", self._addr, silence)
                 ok = await _write_cmd(cli, b"PING")
                 if not ok:
-                    log("BLE", f"{self.address} PING write failed — forcing disconnect")
+                    self._log.warning("%s  PING write failed — forcing disconnect", self._addr)
                     self._disconnect_event.set()
                     return
 
+    async def _stats_loop(self):
+        """Periodic summary so you can see the bridge is alive without flooding."""
+        interval = 30.0
+        while True:
+            await asyncio.sleep(interval)
+            self._log.info("%s  alive  session_frames=%d  %s",
+                           self._addr, self._session_frames, self.asm.stats_line())
+
     @staticmethod
     async def _wait_text(q: asyncio.Queue, pattern: str, timeout: float) -> Optional[str]:
-        """Drain queue looking for a text notification matching pattern."""
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -544,8 +637,10 @@ class DeviceSession:
                 if pattern in text:
                     return text
 
+# ─── Bridge (scan + manage sessions) ────────────────────────────────
 
-# ─── Bridge (scan + manage sessions) ───────────────────────────────
+_bridge_log = _log("scan")
+
 class Bridge:
     def __init__(self):
         self.asm = Assembler()
@@ -556,7 +651,6 @@ class Bridge:
 
         retry_delay = 2.0
         while True:
-            # Clean up finished sessions
             self._cleanup_sessions()
 
             active = sum(1 for s in self.sessions.values() if s.connected)
@@ -564,6 +658,7 @@ class Bridge:
             free_slots = MAX_DEVICES - total
 
             if free_slots <= 0:
+                _bridge_log.debug("all slots occupied (%d/%d connected)", active, total)
                 await asyncio.sleep(SCAN_PERIOD)
                 continue
 
@@ -571,18 +666,17 @@ class Bridge:
                 candidates = await self._scan()
                 retry_delay = 2.0
             except (OSError, FileNotFoundError) as e:
-                log("BLE", f"Bluetooth not available: {e}")
-                log("BLE", f"Retrying in {retry_delay:.0f}s (on macOS — run bridge on host)")
+                _bridge_log.error("bluetooth not available: %s  (retry in %.0fs)", e, retry_delay)
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 60.0)
                 continue
             except Exception as e:
-                log("BLE", f"Scan error: {e}")
+                _bridge_log.error("scan error: %s", e)
                 await asyncio.sleep(5.0)
                 continue
 
             if not candidates:
-                vlog("SCAN", "No devices found")
+                _bridge_log.debug("no devices found")
                 await asyncio.sleep(SCAN_PERIOD)
                 continue
 
@@ -596,12 +690,12 @@ class Bridge:
                 session = DeviceSession(addr, name, self.asm)
                 self.sessions[addr] = session
                 session.start()
-                log("SCAN", f"New device: {addr} ({name})")
 
             await asyncio.sleep(SCAN_PERIOD)
 
     async def _scan(self) -> list:
-        log("SCAN", "Searching for T-Watch-IMU devices…")
+        _bridge_log.info("scanning for %s devices…  slots=%d/%d",
+                         DEVICE_NAME_SUBSTR, len(self.sessions), MAX_DEVICES)
         seen = {}
 
         def cb(dev, ad):
@@ -620,7 +714,9 @@ class Bridge:
 
         for addr, (d, ad) in seen.items():
             rssi = getattr(ad, "rssi", None)
-            log("SCAN", f"Found {addr} ({_dev_name(d, ad)}) RSSI={rssi}")
+            _bridge_log.info("found %s  name=%s  RSSI=%s", addr[-8:], _dev_name(d, ad), rssi)
+        if not seen:
+            _bridge_log.debug("scan complete — 0 candidates")
         return list(seen.values())
 
     def _cleanup_sessions(self):
@@ -628,17 +724,19 @@ class Bridge:
                 if s._task is not None and s._task.done()]
         for addr in dead:
             del self.sessions[addr]
-            vlog("SCAN", f"Cleaned up session for {addr}")
+            _bridge_log.debug("cleaned up session %s", addr[-8:])
 
     async def shutdown(self):
         for s in self.sessions.values():
             await s.stop()
         self.sessions.clear()
 
+# ─── Main ────────────────────────────────────────────────────────────
 
-# ─── Main ──────────────────────────────────────────────────────────
 async def main():
-    log("MAIN", f"WS server: ws://{WS_HOST}:{WS_PORT}/ws/json | /ws/bin")
+    main_log = _log("main")
+    main_log.info("starting  ws=%s:%d  max_devices=%d  log_level=%s",
+                  WS_HOST, WS_PORT, MAX_DEVICES, LOG_LEVEL)
     bridge = Bridge()
     async with serve(ws_router, WS_HOST, WS_PORT, max_size=None):
         try:

@@ -5,7 +5,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- RAW windows
 DROP TABLE IF EXISTS imu_windows CASCADE;
 CREATE TABLE imu_windows (
-  dev_id INT NOT NULL,
+  dev_id BIGINT NOT NULL,
   seq BIGINT NOT NULL,
   ts0 TIMESTAMPTZ NOT NULL,
   fs_hz SMALLINT NOT NULL,
@@ -35,7 +35,7 @@ SELECT add_retention_policy('imu_windows', INTERVAL '30 days');
 -- 1s aggregates
 DROP TABLE IF EXISTS imu_agg_1s CASCADE;
 CREATE TABLE imu_agg_1s (
-  dev_id INT NOT NULL,
+  dev_id BIGINT NOT NULL,
   ts TIMESTAMPTZ NOT NULL,
   a_rms_mg INT NOT NULL,
   a_peak_mg INT NOT NULL,
@@ -56,7 +56,7 @@ SELECT add_retention_policy('imu_agg_1s', INTERVAL '180 days');
 -- per-window features
 DROP TABLE IF EXISTS imu_features CASCADE;
 CREATE TABLE imu_features (
-  dev_id INT NOT NULL,
+  dev_id BIGINT NOT NULL,
   seq BIGINT NOT NULL,
   ts0 TIMESTAMPTZ NOT NULL,
   a_rms_mg INT NOT NULL,

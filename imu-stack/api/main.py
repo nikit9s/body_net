@@ -26,6 +26,20 @@ async def get_pool():
 async def health():
     return {"ok": True}
 
+@app.get("/devices")
+async def list_devices():
+    """Return all known dev_ids that have sent data in the last 24 hours."""
+    pool = await get_pool()
+    q = """
+      SELECT DISTINCT dev_id
+      FROM imu_agg_1s
+      WHERE ts > now() - INTERVAL '24 hours'
+      ORDER BY dev_id
+    """
+    async with pool.acquire() as con:
+        rows = await con.fetch(q)
+    return [r["dev_id"] for r in rows]
+
 @app.get("/agg/10s")
 async def agg_10s(
     dev_id: int = Query(...),
