@@ -23,3 +23,5 @@
 ```
 postgresql://postgres:postgres@127.0.0.1:5433/imu?statusColor=DAEBC2&env=local&name=body_net&tLSMode=0&usePrivateKey=false&safeModeLevel=0&advancedSafeModeLevel=0&driverVersion=0&lazyload=false
 ```
+
+4. Дашборд доступен по адресу http://localhost:8080/
