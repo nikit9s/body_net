@@ -512,9 +512,9 @@ class DeviceSession:
                 await cli.disconnect()
 
     async def _run_session(self, cli: BleakClient) -> bool:
-        svcs = await cli.get_services()
+        svcs = cli.services
         want = {TX_UUID.lower(), RX_UUID.lower()}
-        have = {ch.uuid.lower() for s in svcs for ch in s.characteristics}
+        have = {ch.uuid.lower() for ch in svcs.characteristics.values()}
         if not want.issubset(have):
             self._log.warning("%s  missing TX/RX characteristics", self._addr)
             return False
