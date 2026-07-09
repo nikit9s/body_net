@@ -74,9 +74,18 @@ Supports up to **4 T-Watch devices** simultaneously with automatic discovery and
 
 ### 3. Flash the firmware
 
-Open `firmware/twatch_imu_ble.ino` in Arduino IDE / PlatformIO. Requires:
-- LilyGoWatch library
-- NimBLE-Arduino
+**PlatformIO (recommended — pins exact board/library versions):**
+```bash
+cd firmware
+pio run -t upload    # builds + flashes using firmware/platformio.ini
+```
+
+**Arduino IDE:** open `firmware/twatch_imu_ble/twatch_imu_ble.ino`. Requires:
+- ESP32 board package — pin to the **2.0.x** core (e.g. 2.0.14); the T-Watch library isn't updated for the newer 3.x core
+- TTGO_TWatch_Library (`Xinyuan-LilyGO/TTGO_TWatch_Library` on GitHub)
+- NimBLE-Arduino **2.x** (the BLE callbacks in the sketch use the `NimBLEConnInfo&`-based API introduced in 2.x)
+
+Before flashing a given physical watch, set a unique `DEV_ID` (`firmware/twatch_imu_ble/twatch_imu_ble.ino`) — it's shown on the watch's own screen after boot and is how the dashboard/DB tell devices apart.
 
 Flash to T-Watch 2020. The device advertises as `T-Watch-IMU` and waits for BLE connection.
 

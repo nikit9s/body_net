@@ -18,4 +18,4 @@ bridge:
 
 # macOS / any host — runs bridge directly (needs venv)
 bridge-host:
-	cd bridge && python3 bridge_ble_ws.py
+	cd bridge && python3 -m ble_bridge

@@ -553,7 +553,7 @@ void setup() {
   // BLE
   NimBLEDevice::init(DEVICE_NAME);
   NimBLEDevice::setDeviceName(DEVICE_NAME);
-  NimBLEDevice::setPower(6);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P6);
   NimBLEDevice::setSecurityAuth(false,false,false);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
   NimBLEDevice::setMTU(185);

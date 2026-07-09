@@ -479,16 +479,18 @@
     }
 
     /* -------- Responsive -------- */
-    @media (max-width: 1100px) {
-      .device-grid { grid-template-columns: 1fr; }
-    }
-
+    /* Keep the 2x2 device grid even on narrow screens — panels shrink instead
+       of stacking into a single-column list. */
     @media (max-width: 640px) {
       .app { padding: 12px; }
-      .device-grid { gap: 12px; }
-      .chart-wrap { height: 160px; }
+      .device-grid { gap: 8px; }
+      .chart-wrap { height: 120px; }
+      .panel-header { padding: 8px 10px; flex-wrap: wrap; gap: 6px; }
+      .panel-metrics { gap: 8px; }
+      .panel-metric .pm-value { font-size: 12px; }
+      .panel-body { padding: 8px 10px 4px; }
+      .panel-footer { padding: 4px 10px 8px; }
       header { flex-direction: column; gap: 10px; align-items: flex-start; }
-      .panel-metrics { gap: 10px; }
     }
   </style>
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -580,7 +582,7 @@
   <div class="tooltip" id="tooltip"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-  <script src="./app.js"></script>
+  <script type="module" src="./js/main.js"></script>
 </body>
 
 </html>
