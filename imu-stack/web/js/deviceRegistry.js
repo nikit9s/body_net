@@ -30,6 +30,22 @@ export function setOnFirstDeviceSelected(fn) {
 }
 
 /**
+ * Callback fired whenever a new device ID is registered (every device, not
+ * just the first). Used by the export panel to add its device checkbox,
+ * avoiding a circular import between the registry and that module.
+ * @type {(devId: number) => void}
+ */
+let onDeviceAdded = () => {};
+
+/**
+ * Register the callback invoked whenever a new device ID is registered.
+ * @param {(devId: number) => void} fn
+ */
+export function setOnDeviceAdded(fn) {
+  onDeviceAdded = fn;
+}
+
+/**
  * Short, human-friendly hex label for a device ID (last 4 hex digits).
  * @param {number} devId
  * @returns {string}
@@ -97,6 +113,8 @@ export function addDeviceOption(devId) {
     aggDevSelect.selectedIndex = 1;
     onFirstDeviceSelected();
   }
+
+  onDeviceAdded(devId);
 }
 
 /**

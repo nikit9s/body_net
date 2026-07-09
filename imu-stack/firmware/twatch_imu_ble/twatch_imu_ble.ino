@@ -26,7 +26,7 @@
 #define SAMPLE_Q_DEPTH     1024
 #define FRAME_POOL_SZ      6
 #define TX_NOTIFY_DELAY_MS 8
-#define DEV_ID             1
+#define DEV_ID             4
 
 // BLE UUIDs
 static const char* SVC_UUID = "6f2d5d52-0f4d-4b2a-a02b-5a7a5b3a0e11";

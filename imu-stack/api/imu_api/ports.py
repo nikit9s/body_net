@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Optional, Protocol, runtime_checkable
 
-from .domain.models import AggBucket, Feature, LatestWindow
+from .domain.models import AggBucket, ExportRow, Feature, LatestWindow
 
 
 @runtime_checkable
@@ -24,22 +24,33 @@ class ImuReadRepository(Protocol):
         """Return distinct ``dev_id`` values seen in the last 24 hours, ordered."""
         ...
 
-    async def agg_10s(
+    async def agg(
         self,
+        resolution: str,
         dev_id: int,
         since: Optional[datetime],
         until: Optional[datetime],
     ) -> List[AggBucket]:
-        """Return 10-second aggregate buckets for a device within a range."""
+        """Return aggregate buckets for a device within a range.
+
+        ``resolution`` is one of ``10s``, ``1m``, ``5m``, ``10m``, ``15m``,
+        ``30m``. Callers must validate ``resolution`` before calling.
+        """
         ...
 
-    async def agg_1m(
+    async def export_rows(
         self,
-        dev_id: int,
-        since: Optional[datetime],
-        until: Optional[datetime],
-    ) -> List[AggBucket]:
-        """Return 1-minute aggregate buckets for a device within a range."""
+        resolution: str,
+        since: datetime,
+        until: datetime,
+        dev_ids: Optional[List[int]],
+    ) -> List[ExportRow]:
+        """Return per-device RMS/peak rows for the xlsx export.
+
+        ``resolution`` is one of ``1s``, ``10s``, ``1m``, ``5m``, ``10m``,
+        ``15m``, ``30m``. When ``dev_ids`` is ``None``, all devices with data
+        in range are included.
+        """
         ...
 
     async def features(

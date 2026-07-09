@@ -20,20 +20,37 @@ export async function fetchKnownDevices() {
 /**
  * Fetch aggregate activity data for a device.
  * @param {number} devId - device ID
- * @param {string} resolution - '1m' or '10s'
+ * @param {string} resolution - '10s' | '1m' | '5m' | '10m' | '15m' | '30m'
  * @param {string} since - ISO timestamp for the lookback window start
  * @returns {Promise<Array<object>|null>} aggregate rows, or null on failure
  */
 export async function fetchAgg(devId, resolution, since) {
-  const endpoint = resolution === '1m' ? '/api/agg/1m' : '/api/agg/10s';
   try {
     const res = await fetch(
-      `${endpoint}?dev_id=${devId}&since=${encodeURIComponent(since)}`
+      `/api/agg/${resolution}?dev_id=${devId}&since=${encodeURIComponent(since)}`
     );
     if (!res.ok) return null;
     return await res.json();
   } catch (err) {
     console.error('Aggregate chart load error:', err);
     return null;
+  }
+}
+
+/**
+ * Download an .xlsx export as a Blob via /api/export/xlsx.
+ * @param {URLSearchParams} params - since/until/resolution/dev_ids query params
+ * @returns {Promise<{ok: true, blob: Blob}|{ok: false, error: string}>}
+ */
+export async function fetchExportXlsx(params) {
+  try {
+    const res = await fetch(`/api/export/xlsx?${params.toString()}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      return { ok: false, error: body.detail || String(res.status) };
+    }
+    return { ok: true, blob: await res.blob() };
+  } catch (err) {
+    return { ok: false, error: String(err) };
   }
 }

@@ -59,6 +59,28 @@ class Feature:
 
 
 @dataclass(frozen=True)
+class ExportRow:
+    """A single per-device sample row for the xlsx export.
+
+    Mirrors the columns ``dev_id, ts, a_rms_mg, a_peak_mg``.
+    """
+
+    dev_id: int
+    ts: datetime
+    a_rms_mg: Optional[float]
+    a_peak_mg: Optional[float]
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the row as a plain dict matching the original response."""
+        return {
+            "dev_id": self.dev_id,
+            "ts": self.ts,
+            "a_rms_mg": self.a_rms_mg,
+            "a_peak_mg": self.a_peak_mg,
+        }
+
+
+@dataclass(frozen=True)
 class LatestWindow:
     """The latest window row from ``imu_windows``.
 

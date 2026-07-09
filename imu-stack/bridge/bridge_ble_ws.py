@@ -213,9 +213,21 @@ class _ReasmEntry:
 
 
 class Assembler:
+    """Reassembles fragments into full frames.
+
+    Shared across all connected devices, so fragments are keyed by
+    ``(conn_id, seq)`` where ``conn_id`` is the BLE connection's own address —
+    not by ``seq`` alone. ``seq`` is a per-device counter that restarts at 0
+    on every connection, so with several devices streaming at the same rate
+    it collides constantly across devices; keying purely on ``seq`` (as this
+    used to) let one device's continuation fragments get appended into
+    another device's in-progress buffer, corrupting the tail of the frame
+    (and failing its CRC) while leaving the header — parsed only from the
+    first fragment — intact.
+    """
+
     def __init__(self):
-        self._map: Dict[Tuple[int, int], _ReasmEntry] = {}
-        self._seq_dev: Dict[int, int] = {}
+        self._map: Dict[Tuple[str, int], _ReasmEntry] = {}
         self._lock = asyncio.Lock()
         self.frames_ok = 0
         self.frames_crc_err = 0
@@ -229,14 +241,13 @@ class Assembler:
             async with self._lock:
                 stale = [k for k, e in self._map.items() if now - e.touched > REASM_TTL]
                 for k in stale:
-                    self._seq_dev.pop(k[1], None)
                     del self._map[k]
                 if stale:
                     self.frags_dropped += len(stale)
                     _asm_log.debug("gc: expired=%d  pending=%d", len(stale), len(self._map))
 
-    async def feed(self, frag: bytes) -> Optional[bytes]:
-        """Feed a BLE notification. Returns completed frame or None."""
+    async def feed(self, conn_id: str, frag: bytes) -> Optional[bytes]:
+        """Feed a BLE notification from connection ``conn_id``. Returns completed frame or None."""
         if len(frag) < FRAG_HDR_SIZE:
             return None
 
@@ -256,10 +267,10 @@ class Assembler:
             return None
 
         if part_idx == 0:
-            return await self._handle_first(seq, body)
-        return await self._handle_continuation(seq, part_idx, body)
+            return await self._handle_first(conn_id, seq, body)
+        return await self._handle_continuation(conn_id, seq, part_idx, body)
 
-    async def _handle_first(self, seq: int, body: bytes) -> Optional[bytes]:
+    async def _handle_first(self, conn_id: str, seq: int, body: bytes) -> Optional[bytes]:
         if len(body) < FRAME_HDR_SIZE:
             return None
         hdr = body[:FRAME_HDR_SIZE]
@@ -270,34 +281,26 @@ class Assembler:
         payload_len = int.from_bytes(hdr[28:32], "little")
         total       = FRAME_HDR_SIZE + payload_len + 4
         tail        = body[FRAME_HDR_SIZE:]
-        dev_id      = int.from_bytes(hdr[4:8], "little")
 
         async with self._lock:
             entry = _ReasmEntry(total, parts, hdr, tail)
-            self._map[(dev_id, seq)] = entry
-            self._seq_dev[seq] = dev_id
-
-        # _asm_log.debug("frag[0]: dev=%d seq=%d parts=%d total=%d B", dev_id, seq, parts, total)
+            self._map[(conn_id, seq)] = entry
 
         if entry.got == total:
-            return await self._complete(dev_id, seq)
+            return await self._complete(conn_id, seq)
         return None
 
-    async def _handle_continuation(self, seq: int, idx: int, body: bytes) -> Optional[bytes]:
+    async def _handle_continuation(self, conn_id: str, seq: int, idx: int, body: bytes) -> Optional[bytes]:
         async with self._lock:
-            dev_id = self._seq_dev.get(seq)
-            if dev_id is None:
-                return None
-            entry = self._map.get((dev_id, seq))
+            entry = self._map.get((conn_id, seq))
             if entry is None or idx in entry.seen:
                 return None
             end = entry.got + len(body)
             if end > len(entry.buf):
-                del self._map[(dev_id, seq)]
-                self._seq_dev.pop(seq, None)
+                del self._map[(conn_id, seq)]
                 self.frags_dropped += 1
-                _asm_log.warning("frag overflow: dev=%d seq=%d idx=%d (%d > %d)",
-                                 dev_id, seq, idx, end, len(entry.buf))
+                _asm_log.warning("frag overflow: conn=%s seq=%d idx=%d (%d > %d)",
+                                 conn_id, seq, idx, end, len(entry.buf))
                 return None
             entry.buf[entry.got:end] = body
             entry.got = end
@@ -305,17 +308,14 @@ class Assembler:
             entry.touched = time.monotonic()
             if entry.got != len(entry.buf):
                 return None
-        return await self._complete(dev_id, seq)
+        return await self._complete(conn_id, seq)
 
-    async def _complete(self, dev_id: int, seq: int) -> bytes:
+    async def _complete(self, conn_id: str, seq: int) -> bytes:
         async with self._lock:
-            entry = self._map.pop((dev_id, seq), None)
-            self._seq_dev.pop(seq, None)
+            entry = self._map.pop((conn_id, seq), None)
         if entry is None:
             return None
         self.frames_ok += 1
-        # _asm_log.debug("frame complete: dev=%d seq=%d (%d B)  total_ok=%d",
-        #                dev_id, seq, len(entry.buf), self.frames_ok)
         return bytes(entry.buf)
 
     def stats_line(self) -> str:
@@ -533,6 +533,15 @@ class DeviceSession:
 
         await cli.start_notify(TX_UUID, on_notify)
 
+        # Force a clean slate before handshaking: if the watch was already
+        # running (e.g. the bridge was restarted while it kept streaming from
+        # an earlier session), it can be too busy pushing notifications to
+        # process START/TIME promptly, which causes missed ACKs and corrupts
+        # in-flight frames. STOP quiesces it regardless of prior state.
+        await asyncio.sleep(0.15)
+        await _write_cmd(cli, b"STOP")
+        await self._wait_text(notify_q, "ACK:STOP", 1.0)
+
         # Handshake: TIME sync
         await asyncio.sleep(0.15)
         await _write_cmd(cli, f"TIME:{int(time.time())}".encode())
@@ -581,7 +590,7 @@ class DeviceSession:
                         self._log.debug("%s  txt: %s", self._addr, data.decode("utf-8", "ignore"))
                     continue
 
-                frame = await self.asm.feed(data)
+                frame = await self.asm.feed(self.address, data)
                 if frame is None:
                     continue
 

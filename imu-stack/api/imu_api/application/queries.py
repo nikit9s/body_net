@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Optional
 
-from ..domain.models import AggBucket, Feature, LatestWindow
+from ..domain.models import AggBucket, ExportRow, Feature, LatestWindow
 from ..ports import ImuReadRepository
 
 
@@ -30,23 +30,25 @@ class ImuQueryService:
         """Return distinct device ids active in the last 24 hours, ordered."""
         return await self._repo.list_devices()
 
-    async def agg_10s(
+    async def agg(
         self,
+        resolution: str,
         dev_id: int,
         since: Optional[datetime],
         until: Optional[datetime],
     ) -> List[AggBucket]:
-        """Return 10-second aggregate buckets for a device within a range."""
-        return await self._repo.agg_10s(dev_id, since, until)
+        """Return aggregate buckets for a device within a range, at the given resolution."""
+        return await self._repo.agg(resolution, dev_id, since, until)
 
-    async def agg_1m(
+    async def export_rows(
         self,
-        dev_id: int,
-        since: Optional[datetime],
-        until: Optional[datetime],
-    ) -> List[AggBucket]:
-        """Return 1-minute aggregate buckets for a device within a range."""
-        return await self._repo.agg_1m(dev_id, since, until)
+        resolution: str,
+        since: datetime,
+        until: datetime,
+        dev_ids: Optional[List[int]],
+    ) -> List[ExportRow]:
+        """Return per-device RMS/peak rows for the xlsx export."""
+        return await self._repo.export_rows(resolution, since, until, dev_ids)
 
     async def features(
         self,

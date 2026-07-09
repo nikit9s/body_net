@@ -63,4 +63,26 @@ export const AGG_COLORS = Object.freeze({
   steps: { line: 'rgba(45, 212, 160, 0.85)', fill: 'rgba(45, 212, 160, 0.08)' },
 });
 
+/**
+ * Lookback window shown for each aggregate resolution — wider buckets need a
+ * longer window, otherwise the chart would only ever show a couple of points.
+ */
+export const AGG_LOOKBACK_MS = Object.freeze({
+  '10s': 60 * 60 * 1000,               // 1 hour
+  '1m':  6 * 60 * 60 * 1000,           // 6 hours
+  '5m':  24 * 60 * 60 * 1000,          // 1 day
+  '10m': 2 * 24 * 60 * 60 * 1000,      // 2 days
+  '15m': 3 * 24 * 60 * 60 * 1000,      // 3 days
+  '30m': 7 * 24 * 60 * 60 * 1000,      // 7 days
+});
+
+export const AGG_LOOKBACK_LABEL = Object.freeze({
+  '10s': 'Last Hour',
+  '1m':  'Last 6 Hours',
+  '5m':  'Last 24 Hours',
+  '10m': 'Last 2 Days',
+  '15m': 'Last 3 Days',
+  '30m': 'Last 7 Days',
+});
+
 export const DATASET_INDEX = Object.freeze({ X: 0, Y: 1, Z: 2, MAG: 3 });

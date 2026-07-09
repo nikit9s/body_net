@@ -3,11 +3,12 @@
  *  aggregate refresh, and init() wiring.
  * ============================================================ */
 
-import { CONFIG } from './config.js';
+import { CONFIG, AGG_LOOKBACK_MS, AGG_LOOKBACK_LABEL } from './config.js';
 import {
   wsStatusText,
   aggDevSelect,
   aggResSelect,
+  aggTitleEl,
   aggCanvasEl,
 } from './dom.js';
 import { magnitude, highPassIIR, countSteps } from './dsp.js';
@@ -22,6 +23,7 @@ import {
 } from './deviceRegistry.js';
 import { updateDeviceDOM, updateChart } from './devicePanel.js';
 import { createAggChart, updateAggChart } from './charts/aggChart.js';
+import { initExportPanel } from './export.js';
 
 let totalFrameCount = 0;
 let aggChart = null;
@@ -99,7 +101,9 @@ async function refreshAggChart() {
   if (devId == null) return;
 
   const resolution = aggResSelect.value;
-  const since = new Date(Date.now() - CONFIG.HEATMAP_LOOKBACK_MS).toISOString();
+  const lookbackMs = AGG_LOOKBACK_MS[resolution] ?? CONFIG.HEATMAP_LOOKBACK_MS;
+  const since = new Date(Date.now() - lookbackMs).toISOString();
+  aggTitleEl.textContent = `Aggregate Activity — ${AGG_LOOKBACK_LABEL[resolution] ?? 'Last Hour'}`;
 
   const data = await fetchAgg(devId, resolution, since);
   if (data == null) return;
@@ -114,6 +118,7 @@ async function refreshAggChart() {
  */
 export function init() {
   setOnFirstDeviceSelected(refreshAggChart);
+  initExportPanel();
   setInterval(checkStaleness, 1000);
 
   const isFileProtocol = location.protocol === 'file:';

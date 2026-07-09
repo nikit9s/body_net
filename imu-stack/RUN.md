@@ -13,7 +13,7 @@
 ```
 
 2. ```bash
-    cd /Users/kirill/work/body_net/imu-stack/bridge
+    cd bridge
     python3 -m venv .venv && source .venv/bin/activate
     pip install -r requirements.txt
     python bridge_ble_ws.py
