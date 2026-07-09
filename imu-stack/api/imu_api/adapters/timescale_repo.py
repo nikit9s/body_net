@@ -34,12 +34,15 @@ _AGG_BUCKET_INTERVALS = {
 }
 
 # Table + time column to read from for export resolutions backed directly by a
-# table (raw per-second, or a materialized continuous aggregate). Resolutions
-# without an entry here (5m/10m/15m/30m) are live-bucketed from imu_agg_1s.
+# table. Only "1s" (the raw per-second table) is safe to read directly: the
+# continuous aggregates refresh on a 1-minute delayed schedule, so reading
+# cagg_imu_agg_10s/1m straight for an export can silently omit devices/rows
+# that haven't been materialized yet (an export is a one-shot "give me
+# everything in this range" request, unlike the live chart, where a
+# temporarily-stale last bucket self-heals on the next refresh). So 10s/1m
+# are live-bucketed from imu_agg_1s too, same as 5m/10m/15m/30m below.
 _EXPORT_SOURCES = {
-    "1s":  ("imu_agg_1s",       "ts",     "a_rms_mg",     "a_peak_mg"),
-    "10s": ("cagg_imu_agg_10s", "bucket", "a_rms_mg_max", "a_peak_mg_max"),
-    "1m":  ("cagg_imu_agg_1m",  "bucket", "a_rms_mg_max", "a_peak_mg_max"),
+    "1s": ("imu_agg_1s", "ts", "a_rms_mg", "a_peak_mg"),
 }
 
 

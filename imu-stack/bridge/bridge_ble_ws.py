@@ -97,6 +97,11 @@ NOTIFY_TIMEOUT     = 8.0
 PING_INTERVAL      = 4.0
 RECONNECT_MIN      = 1.0
 RECONNECT_MAX      = 30.0
+# Windows are produced every (WIN_N-OVERLAP_N)/FS_HZ ≈ 0.64s while actively
+# streaming, so 15s of zero binary fragments (as opposed to zero bytes at
+# all — see _last_frame_data) means the watch's IMU pipeline has stalled
+# even though the BLE link itself still answers PING with PONG.
+FRAME_STALL_TIMEOUT = 15.0
 SCAN_PERIOD        = 8.0
 SCAN_DURATION      = 5.0
 REASM_TTL          = 10.0
@@ -392,10 +397,18 @@ async def _write_cmd(cli: BleakClient, data: bytes) -> bool:
 class DeviceSession:
     """Manages a single T-Watch: connect → handshake → stream → reconnect."""
 
-    def __init__(self, address: str, name: str, asm: Assembler):
+    def __init__(self, address: str, name: str, asm: Assembler, handshake_lock: asyncio.Semaphore):
         self.address = address
         self.name = name
         self.asm = asm
+        # Serializes connect+handshake (TIME/START) across all sessions —
+        # multiple devices starting their handshake in the same instant
+        # (e.g. right after the bridge restarts and reconnects to several
+        # already-known devices at once) overloads the host's BLE stack
+        # badly enough that ACKs get lost for everyone. Streaming itself,
+        # once a device is past its handshake, stays fully concurrent.
+        self._handshake_lock = handshake_lock
+        self._handshake_lock_held = False
         self.connected = False
         self._log = _log("dev")
         self._failures = 0
@@ -403,7 +416,20 @@ class DeviceSession:
         self._task: Optional[asyncio.Task] = None
         self._disconnect_event = asyncio.Event()
         self._last_data = 0.0
+        self._last_frame_data = 0.0
         self._session_frames = 0
+        self._cli: Optional[BleakClient] = None
+        # Set by _process_notifications when ACK:STOP comes back, so a
+        # graceful stop() can confirm the watch actually quiesced before we
+        # yank the BLE link — an unconfirmed STOP is exactly what leaves the
+        # watch mid-stream for the next bridge run to fight with.
+        self._stop_ack = asyncio.Event()
+        # Whether ACK:TIME actually came back this connection. When it
+        # didn't, the watch's own clock may still hold an offset from a
+        # much earlier session (or none at all), so frames get stamped with
+        # the bridge's wall clock at receipt instead of the device's ts0_ns
+        # — see _process_notifications.
+        self._time_synced = False
 
     @property
     def _addr(self) -> str:
@@ -417,6 +443,16 @@ class DeviceSession:
 
     async def stop(self):
         self._stop.set()
+        if self.connected and self._cli is not None:
+            self._log.info("%s  graceful shutdown: sending STOP", self._addr)
+            self._stop_ack.clear()
+            with contextlib.suppress(Exception):
+                await _write_cmd(self._cli, b"STOP")
+            try:
+                await asyncio.wait_for(self._stop_ack.wait(), timeout=1.5)
+                self._log.info("%s  STOP acked — watch quiesced before disconnect", self._addr)
+            except asyncio.TimeoutError:
+                self._log.warning("%s  STOP not acked before shutdown timeout — disconnecting anyway", self._addr)
         self._disconnect_event.set()
         if self._task:
             self._task.cancel()
@@ -490,6 +526,7 @@ class DeviceSession:
         self._log.info("%s  connecting  name=%s", self._addr, self.name)
         self._disconnect_event.clear()
         self._last_data = time.monotonic()
+        self._last_frame_data = time.monotonic()
 
         def on_disconnect(_cli):
             self._log.info("%s  BLE disconnected (callback)  session_frames=%d",
@@ -497,22 +534,40 @@ class DeviceSession:
             self.connected = False
             self._disconnect_event.set()
 
+        await self._handshake_lock.acquire()
+        self._handshake_lock_held = True
         try:
-            cli = BleakClient(
-                self.address,
-                timeout=CONNECT_TIMEOUT,
-                disconnected_callback=on_disconnect,
-            )
-            await cli.connect()
-        except (BleakError, asyncio.TimeoutError, OSError) as e:
-            self._log.warning("%s  connect failed: %s", self._addr, e)
-            return False
+            try:
+                cli = BleakClient(
+                    self.address,
+                    timeout=CONNECT_TIMEOUT,
+                    disconnected_callback=on_disconnect,
+                )
+                await cli.connect()
+            except (BleakError, asyncio.TimeoutError, OSError) as e:
+                self._log.warning("%s  connect failed: %s", self._addr, e)
+                return False
 
-        try:
-            return await self._run_session(cli)
+            self._cli = cli
+            try:
+                return await self._run_session(cli)
+            finally:
+                self._cli = None
+                with contextlib.suppress(Exception):
+                    await cli.disconnect()
         finally:
-            with contextlib.suppress(Exception):
-                await cli.disconnect()
+            # _run_session releases the lock itself right after the
+            # handshake completes, so streaming doesn't hold up other
+            # devices' connects; this only catches early-return paths
+            # (connect failure, missing characteristics) that never got
+            # that far. Guarded by our own flag, not the semaphore's shared
+            # state — another session may already have acquired it by now.
+            self._release_handshake_lock()
+
+    def _release_handshake_lock(self):
+        if self._handshake_lock_held:
+            self._handshake_lock_held = False
+            self._handshake_lock.release()
 
     async def _run_session(self, cli: BleakClient) -> bool:
         svcs = cli.services
@@ -538,15 +593,45 @@ class DeviceSession:
         # an earlier session), it can be too busy pushing notifications to
         # process START/TIME promptly, which causes missed ACKs and corrupts
         # in-flight frames. STOP quiesces it regardless of prior state.
+        #
+        # Retried like TIME/START: a single attempt can itself get lost in
+        # the same congestion it's meant to relieve — an already-streaming
+        # watch may not service this write for a while, so one shot often
+        # isn't enough to actually break the cycle. Once STOP truly lands,
+        # the watch falls quiet and the rest of the handshake gets through
+        # far more reliably.
         await asyncio.sleep(0.15)
-        await _write_cmd(cli, b"STOP")
-        await self._wait_text(notify_q, "ACK:STOP", 1.0)
+        stopped = False
+        for attempt in range(5):
+            await _write_cmd(cli, b"STOP")
+            ack = await self._wait_text(notify_q, "ACK:STOP", 1.5)
+            if ack:
+                stopped = True
+                break
+            self._log.debug("%s  STOP attempt %d/5: no ack", self._addr, attempt + 1)
+        if not stopped:
+            self._log.warning("%s  STOP never acked — proceeding anyway", self._addr)
 
-        # Handshake: TIME sync
+        # Handshake: TIME sync — retried like START. A silently-dropped TIME
+        # write used to leave the watch on whatever offset it had before
+        # (from an earlier session, or none at all), producing frames whose
+        # timestamps are consistently off by however long ago that offset
+        # was actually set, even though the watch is streaming live right
+        # now. Each attempt re-sends the current time, not a stale value.
         await asyncio.sleep(0.15)
-        await _write_cmd(cli, f"TIME:{int(time.time())}".encode())
-        ack = await self._wait_text(notify_q, "ACK:TIME", 2.0)
-        self._log.debug("%s  TIME sync: %s", self._addr, "ok" if ack else "no ack")
+        time_synced = False
+        for attempt in range(3):
+            await _write_cmd(cli, f"TIME:{int(time.time())}".encode())
+            ack = await self._wait_text(notify_q, "ACK:TIME", 1.5)
+            if ack:
+                time_synced = True
+                break
+            self._log.debug("%s  TIME sync attempt %d/3: no ack", self._addr, attempt + 1)
+        self._time_synced = time_synced
+        if not time_synced:
+            self._log.warning(
+                "%s  TIME sync failed after 3 attempts — stamping frames with bridge time instead of device clock",
+                self._addr)
 
         # Handshake: START
         started = False
@@ -560,6 +645,10 @@ class DeviceSession:
 
         if not started:
             self._log.warning("%s  no ACK:START — listening anyway", self._addr)
+
+        # Handshake is done — let the next queued-up device start connecting
+        # instead of waiting for this one's whole streaming session.
+        self._release_handshake_lock()
 
         self.connected = True
         self._failures = 0
@@ -587,8 +676,19 @@ class DeviceSession:
             try:
                 if len(data) < FRAG_HDR_SIZE:
                     if len(data) <= 64 and all(32 <= b < 127 for b in data):
-                        self._log.debug("%s  txt: %s", self._addr, data.decode("utf-8", "ignore"))
+                        text = data.decode("utf-8", "ignore")
+                        self._log.debug("%s  txt: %s", self._addr, text)
+                        if "ACK:STOP" in text:
+                            self._stop_ack.set()
                     continue
+
+                # Only genuine binary fragments count towards "the IMU stream
+                # is alive" — text replies (PONG/ACK/STATE) also arrive on
+                # this same notify channel and would otherwise mask a dead
+                # stream: the ping watchdog's own PING/PONG keep-alive
+                # traffic refreshes _last_data even after the watch stops
+                # producing windows, so it never trips on that alone.
+                self._last_frame_data = time.monotonic()
 
                 frame = await self.asm.feed(self.address, data)
                 if frame is None:
@@ -596,6 +696,13 @@ class DeviceSession:
 
                 try:
                     obj = frame_to_json(frame)
+                    if not self._time_synced:
+                        # Device clock is unconfirmed this connection — the
+                        # DB only buckets by whole second anyway, so the
+                        # bridge's own receipt time is both trustworthy and
+                        # precise enough, unlike whatever stale offset the
+                        # watch might still be carrying.
+                        obj["meta"]["ts0_ns"] = time.time_ns()
                     await hub.broadcast_json(obj)
                     self._session_frames += 1
                 except ValueError as e:
@@ -614,6 +721,14 @@ class DeviceSession:
 
             if silence > NOTIFY_TIMEOUT:
                 self._log.warning("%s  no data for %.1fs — forcing disconnect", self._addr, silence)
+                self._disconnect_event.set()
+                return
+
+            frame_silence = time.monotonic() - self._last_frame_data
+            if frame_silence > FRAME_STALL_TIMEOUT:
+                self._log.warning(
+                    "%s  no IMU frames for %.1fs (link alive, PING/PONG still answering) — forcing disconnect",
+                    self._addr, frame_silence)
                 self._disconnect_event.set()
                 return
 
@@ -657,6 +772,7 @@ class Bridge:
     def __init__(self):
         self.asm = Assembler()
         self.sessions: Dict[str, DeviceSession] = {}
+        self.handshake_lock = asyncio.Semaphore(1)
 
     async def run(self):
         asyncio.create_task(self.asm.cleanup_loop())
@@ -699,7 +815,7 @@ class Bridge:
                 if addr in self.sessions:
                     continue
                 name = _dev_name(dev, ad)
-                session = DeviceSession(addr, name, self.asm)
+                session = DeviceSession(addr, name, self.asm, self.handshake_lock)
                 self.sessions[addr] = session
                 session.start()
 
@@ -760,10 +876,17 @@ async def main():
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    main_task = loop.create_task(main())
+    # Cancel main() itself rather than calling loop.stop() — stopping the
+    # loop directly leaves run_until_complete's future unfinished, so
+    # main()'s `finally: await bridge.shutdown()` (which sends STOP to each
+    # watch) never runs and every device is left mid-stream for the next run.
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, loop.stop)
+            loop.add_signal_handler(sig, main_task.cancel)
     try:
-        loop.run_until_complete(main())
+        loop.run_until_complete(main_task)
+    except asyncio.CancelledError:
+        pass
     finally:
         loop.close()
