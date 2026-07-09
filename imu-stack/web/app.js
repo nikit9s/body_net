@@ -68,9 +68,15 @@ const activeCountEl = document.getElementById('active-count');
 const totalFramesEl = document.getElementById('total-frames');
 const aggDevSelect = document.getElementById('hm-dev');
 const aggResSelect = document.getElementById('agg-resolution');
+const aggTitleEl = document.getElementById('agg-title');
 const aggCanvasEl = document.getElementById('agg-chart');
 const tooltipEl = document.getElementById('tooltip');
 const deviceGridEl = document.getElementById('device-grid');
+const exportSinceEl = document.getElementById('export-since');
+const exportUntilEl = document.getElementById('export-until');
+const exportResolutionEl = document.getElementById('export-resolution');
+const exportDevicesEl = document.getElementById('export-devices');
+const exportBtnEl = document.getElementById('export-btn');
 
 // --------------- Per-device state ---------------
 
@@ -82,6 +88,59 @@ let totalFrameCount = 0;
 function shortDevId(devId) {
   const hex = (devId >>> 0).toString(16).toUpperCase();
   return hex.length > 4 ? '\u2026' + hex.slice(-4) : hex;
+}
+
+// --------------- Friendly device labels (persisted per-browser) ---------------
+// dev_id is a firmware-time constant (DEV_ID, see twatch_imu_ble.ino) \u2014 the same
+// number is shown on the watch's own screen. These labels are just a local
+// display alias on top of it (e.g. "Alice \u2014 left wrist") so panels/dropdowns
+// don't only show raw numbers.
+
+const DEVICE_LABELS_KEY = 'bodynet_device_labels';
+
+function loadDeviceLabels() {
+  try {
+    return JSON.parse(localStorage.getItem(DEVICE_LABELS_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+const deviceLabels = loadDeviceLabels();
+
+function getDeviceLabel(devId) {
+  return deviceLabels[devId] || `Device ${shortDevId(devId)}`;
+}
+
+function setDeviceLabel(devId, name) {
+  const trimmed = (name || '').trim();
+  if (trimmed) {
+    deviceLabels[devId] = trimmed;
+  } else {
+    delete deviceLabels[devId];
+  }
+  localStorage.setItem(DEVICE_LABELS_KEY, JSON.stringify(deviceLabels));
+  refreshAllDeviceLabels();
+}
+
+function promptRenameDevice(devId) {
+  const name = prompt(`Label for device ${devId} (leave empty to reset):`, deviceLabels[devId] || '');
+  if (name !== null) setDeviceLabel(devId, name);
+}
+
+function refreshAllDeviceLabels() {
+  for (const state of devices.values()) {
+    if (state.els.label) state.els.label.textContent = getDeviceLabel(state.id);
+  }
+  for (const opt of aggDevSelect.options) {
+    if (!opt.value) continue;
+    opt.textContent = `${getDeviceLabel(Number(opt.value))} (${opt.value})`;
+  }
+  exportDevicesEl.querySelectorAll('label').forEach(lbl => {
+    const input = lbl.querySelector('input[type="checkbox"]');
+    const text = lbl.querySelector('[data-el="text"]');
+    if (input && text) text.textContent = getDeviceLabel(Number(input.value));
+  });
 }
 
 function getOrCreateDevice(devId) {
@@ -123,13 +182,25 @@ function addDeviceOption(devId) {
 
   const opt = document.createElement('option');
   opt.value = devId;
-  opt.textContent = `Device ${shortDevId(devId)} (${devId})`;
+  opt.textContent = `${getDeviceLabel(devId)} (${devId})`;
   aggDevSelect.appendChild(opt);
 
   if (aggDevSelect.options.length === 2) {
     aggDevSelect.selectedIndex = 1;
     refreshAggChart();
   }
+
+  addExportDeviceCheckbox(devId);
+}
+
+function addExportDeviceCheckbox(devId) {
+  if (exportDevicesEl.querySelector(`input[value="${devId}"]`)) return;
+  if (exportDevicesEl.querySelector('.header-stat')) exportDevicesEl.innerHTML = '';
+
+  const label = document.createElement('label');
+  label.innerHTML = `<input type="checkbox" value="${devId}" checked /><span data-el="text"></span>`;
+  label.querySelector('[data-el="text"]').textContent = getDeviceLabel(devId);
+  exportDevicesEl.appendChild(label);
 }
 
 async function fetchKnownDevices() {
@@ -156,7 +227,7 @@ function buildDevicePanel(state) {
     <div class="panel-header">
       <div class="panel-id">
         <div class="dev-indicator"></div>
-        <span class="dev-label">Device ${label}</span>
+        <span class="dev-label" data-el="label" title="Double-click to rename">Device ${label}</span>
         <span class="dev-sublabel" data-el="status">waiting</span>
       </div>
       <div class="panel-metrics">
@@ -214,6 +285,9 @@ function buildDevicePanel(state) {
   panel.querySelectorAll('[data-el]').forEach(el => {
     state.els[el.dataset.el] = el;
   });
+
+  state.els.label.textContent = getDeviceLabel(state.id);
+  state.els.label.addEventListener('dblclick', () => promptRenameDevice(state.id));
 
   initLegendToggles(state, panel);
   state.chart = createChart(state.els.canvas, state.showAxes);
@@ -471,6 +545,26 @@ const AGG_COLORS = Object.freeze({
   steps: { line: 'rgba(45, 212, 160, 0.85)', fill: 'rgba(45, 212, 160, 0.08)' },
 });
 
+// Lookback window shown for each aggregate resolution — wider buckets need a
+// longer window, otherwise the chart would only ever show a couple of points.
+const AGG_LOOKBACK_MS = Object.freeze({
+  '10s': 60 * 60 * 1000,               // 1 hour
+  '1m':  6 * 60 * 60 * 1000,           // 6 hours
+  '5m':  24 * 60 * 60 * 1000,          // 1 day
+  '10m': 2 * 24 * 60 * 60 * 1000,      // 2 days
+  '15m': 3 * 24 * 60 * 60 * 1000,      // 3 days
+  '30m': 7 * 24 * 60 * 60 * 1000,      // 7 days
+});
+
+const AGG_LOOKBACK_LABEL = Object.freeze({
+  '10s': 'Last Hour',
+  '1m':  'Last 6 Hours',
+  '5m':  'Last 24 Hours',
+  '10m': 'Last 2 Days',
+  '15m': 'Last 3 Days',
+  '30m': 'Last 7 Days',
+});
+
 let aggChart = null;
 
 function createAggChart() {
@@ -611,12 +705,13 @@ async function refreshAggChart() {
   if (devId == null) return;
 
   const resolution = aggResSelect.value;
-  const endpoint = resolution === '1m' ? '/api/agg/1m' : '/api/agg/10s';
-  const since = new Date(Date.now() - CONFIG.HEATMAP_LOOKBACK_MS).toISOString();
+  const lookbackMs = AGG_LOOKBACK_MS[resolution] ?? CONFIG.HEATMAP_LOOKBACK_MS;
+  const since = new Date(Date.now() - lookbackMs).toISOString();
+  aggTitleEl.textContent = `Aggregate Activity — ${AGG_LOOKBACK_LABEL[resolution] ?? 'Last Hour'}`;
 
   try {
     const res = await fetch(
-      `${endpoint}?dev_id=${devId}&since=${encodeURIComponent(since)}`
+      `/api/agg/${resolution}?dev_id=${devId}&since=${encodeURIComponent(since)}`
     );
     if (!res.ok) return;
     const data = await res.json();
@@ -631,6 +726,77 @@ async function refreshAggChart() {
     aggChart.update('none');
   } catch (err) {
     console.error('Aggregate chart load error:', err);
+  }
+}
+
+// --------------- Excel export ---------------
+
+function toDatetimeLocalValue(date) {
+  const pad = n => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function initExportDefaults() {
+  const now = new Date();
+  const hourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+  exportUntilEl.value = toDatetimeLocalValue(now);
+  exportSinceEl.value = toDatetimeLocalValue(hourAgo);
+}
+
+async function handleExportClick() {
+  const sinceVal = exportSinceEl.value;
+  const untilVal = exportUntilEl.value;
+  if (!sinceVal || !untilVal) {
+    alert('Укажите обе даты диапазона.');
+    return;
+  }
+
+  const since = new Date(sinceVal);
+  const until = new Date(untilVal);
+  if (since >= until) {
+    alert('Дата "From" должна быть раньше даты "To".');
+    return;
+  }
+
+  const resolution = exportResolutionEl.value;
+  const checkedDevIds = Array.from(
+    exportDevicesEl.querySelectorAll('input[type="checkbox"]:checked')
+  ).map(cb => cb.value);
+
+  const params = new URLSearchParams({
+    since: since.toISOString(),
+    until: until.toISOString(),
+    resolution,
+  });
+  if (checkedDevIds.length > 0) {
+    params.set('dev_ids', checkedDevIds.join(','));
+  }
+
+  exportBtnEl.disabled = true;
+  exportBtnEl.textContent = 'Экспорт…';
+  try {
+    const res = await fetch(`/api/export/xlsx?${params.toString()}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      alert(`Ошибка экспорта: ${body.detail || res.status}`);
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `imu_export_${resolution}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    console.error('Export error:', err);
+    alert('Не удалось скачать файл экспорта.');
+  } finally {
+    exportBtnEl.disabled = false;
+    exportBtnEl.textContent = 'Скачать .xlsx';
   }
 }
 
@@ -690,6 +856,9 @@ function scheduleReconnect() {
 // --------------- Init ---------------
 
 const isFileProtocol = location.protocol === 'file:';
+
+initExportDefaults();
+exportBtnEl.addEventListener('click', handleExportClick);
 
 if (isFileProtocol) {
   wsStatusText.textContent = 'Open via http://localhost:8080';

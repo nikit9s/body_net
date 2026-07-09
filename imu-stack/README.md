@@ -89,7 +89,7 @@ Navigate to [http://localhost:8080](http://localhost:8080).
 1. **Firmware** — samples BMA423 at 100 Hz, packs 128-sample windows (50% overlap), sends binary frames over BLE with CRC32
 2. **Bridge** — receives BLE notifications, reassembles fragmented frames, verifies CRC, broadcasts JSON over WebSocket
 3. **Worker** — consumes WebSocket, writes raw windows + computed features (RMS, peak, steps) to TimescaleDB
-4. **API** — serves aggregated data (`/agg/10s`, `/agg/1m`, `/features`, `/windows/latest`)
+4. **API** — serves aggregated data (`/agg/{10s,1m,5m,10m,15m,30m}`, `/features`, `/windows/latest`)
 5. **Frontend** — real-time chart via WebSocket, activity heatmap via REST API
 
 ## Database
@@ -111,10 +111,10 @@ Compression after 3–6 hours, retention: 30 days (windows), 180 days (features/
 | Method | Path | Params | Description |
 |--------|------|--------|-------------|
 | GET | `/health` | — | Health check |
-| GET | `/agg/10s` | `dev_id`, `since?`, `until?` | 10-second aggregates |
-| GET | `/agg/1m` | `dev_id`, `since?`, `until?` | 1-minute aggregates |
+| GET | `/agg/{resolution}` | `dev_id`, `since?`, `until?` | Aggregates for `resolution` = `10s`\|`1m`\|`5m`\|`10m`\|`15m`\|`30m`. `10s`/`1m` read the continuous aggregates; wider buckets are computed live from `imu_agg_1s` |
 | GET | `/features` | `dev_id`, `since?`, `until?`, `limit?` | Per-window features |
 | GET | `/windows/latest` | `dev_id` | Latest raw window metadata |
+| GET | `/export/xlsx` | `since?`, `until?`, `resolution?` (`1s`\|`10s`\|`1m`\|`5m`\|`10m`\|`15m`\|`30m`), `dev_ids?` | Download an .xlsx workbook — time as rows, one column per device; sheets `RMS_mG` and `Peak_mG`. Defaults to the last hour, all devices, 1‑minute resolution |
 
 ## Useful Commands
 

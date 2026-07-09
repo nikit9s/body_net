@@ -500,7 +500,7 @@ static void drawStatus() {
   tft->fillScreen(TFT_BLACK);
   tft->setTextFont(2);
   tft->setTextColor(TFT_CYAN, TFT_BLACK);
-  tft->drawString("BodyNet IMU (mg)", 20, 8);
+  tft->drawString(String("BodyNet IMU #") + DEV_ID + " (mg)", 20, 8);
   tft->setTextColor(TFT_WHITE, TFT_BLACK);
   tft->drawString(String("BLE: ")   + (g_connected?"ON":"OFF"), 10, 40);
   tft->drawString(String("SYNC: ")  + (g_timeSync?"OK":"NO"),    10, 60);

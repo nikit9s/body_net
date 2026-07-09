@@ -19,6 +19,7 @@ from typing import Dict, Optional, Set, Tuple
 
 from bleak import BleakClient, BleakError, BleakScanner
 from websockets import serve
+from websockets.exceptions import ConnectionClosed
 
 # ─── Logging ─────────────────────────────────────────────────────────
 
@@ -176,6 +177,8 @@ async def _ws_keepalive(ws):
     try:
         async for _ in ws:
             pass
+    except ConnectionClosed:
+        pass  # client vanished without a clean close handshake — not an error
     finally:
         await hub.remove(ws)
 
